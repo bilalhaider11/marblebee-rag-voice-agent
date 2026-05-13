@@ -1,0 +1,951 @@
+{
+  "name": "MarbleBee RAG — 01 Indexing (Crawl, Chunk, Embed, Store)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Indexing Workflow — offline knowledge pipeline\n\n**Purpose:** keep the Supabase vector index in sync with `marblebee.com`.\n\n**Triggers:**\n- Manual (`▶ Execute workflow`) — for ad-hoc refresh after a content edit\n- Schedule — daily at 03:00 in `America/New_York`\n\n**Pipeline:**\n1. Fetch `sitemap.xml` (fallback: crawl from homepage with depth limit)\n2. For each URL, fetch the HTML, extract clean text, and compute a content hash\n3. Compare hash with what's stored in `marblebee_sources` — **skip unchanged pages**\n4. For changed pages, delete their old chunks (`delete_marblebee_chunks_by_source`)\n5. Upsert the source row\n6. Pass content into the LangChain pipeline:\n   `Recursive Splitter → Document Loader → Embeddings (text-embedding-3-small) → Vector Store Insert`\n7. Email an indexing report (pages indexed, chunks created, tokens used, runtime)\n\n**Idempotent.** Re-running the same workflow without site changes does ~0 work.\n\n**Cost per full re-index of a small site (~50 pages):** roughly $0.05 in OpenAI embedding fees and a few seconds of Supabase write.",
+        "height": 380,
+        "width": 740,
+        "color": 4
+      },
+      "id": "note-overview",
+      "name": "Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -280,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 1. Triggers & configuration\nManual + scheduled entry points feed into a single `Set` node where all knobs live (sitemap URL, max pages, batch size, allowed/blocked URL patterns).",
+        "height": 220,
+        "width": 980,
+        "color": 5
+      },
+      "id": "note-triggers",
+      "name": "Section 1 Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -280,
+        160
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "trigger-manual",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -220,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 3 * * *"
+            }
+          ]
+        }
+      },
+      "id": "trigger-schedule",
+      "name": "Schedule (Daily 03:00)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -220,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "site-url",
+              "name": "siteBaseUrl",
+              "value": "={{ $env.SITE_BASE_URL }}",
+              "type": "string"
+            },
+            {
+              "id": "sitemap-url",
+              "name": "sitemapUrl",
+              "value": "={{ $env.SITEMAP_URL }}",
+              "type": "string"
+            },
+            {
+              "id": "max-pages",
+              "name": "maxPages",
+              "value": "2000",
+              "type": "number"
+            },
+            {
+              "id": "start-page",
+              "name": "startPage",
+              "value": "0",
+              "type": "number"
+            },
+            {
+              "id": "batch-size",
+              "name": "batchSize",
+              "value": "1",
+              "type": "number"
+            },
+            {
+              "id": "user-agent",
+              "name": "userAgent",
+              "value": "MarbleBeeIndexerBot/1.0 (+https://marblebee.com/bot)",
+              "type": "string"
+            },
+            {
+              "id": "allow-paths",
+              "name": "allowPathPatterns",
+              "value": "/,/products,/collections,/pages,/blogs",
+              "type": "string"
+            },
+            {
+              "id": "block-paths",
+              "name": "blockPathPatterns",
+              "value": "/cart,/checkout,/account,/login,/admin,/api,/wp-admin,/search",
+              "type": "string"
+            },
+            {
+              "id": "started-at",
+              "name": "startedAt",
+              "value": "={{ $now.toISO() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "set-config",
+      "name": "Indexing Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        40,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 2. URL discovery\nTry sitemap.xml first (fast, comprehensive). If it fails or is empty, crawl from the homepage breadth-first up to the configured depth, then filter against allow/block patterns.",
+        "height": 220,
+        "width": 1100,
+        "color": 5
+      },
+      "id": "note-discovery",
+      "name": "Section 2 Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        780,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Indexing Config').first().json.sitemapUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $('Indexing Config').first().json.userAgent }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 10000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true
+            }
+          }
+        }
+      },
+      "id": "http-sitemap",
+      "name": "Fetch Sitemap",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        840,
+        480
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse sitemap XML, recursing into <sitemapindex> children when present.\n// Sandbox-safe: avoids the `URL` and `fetch` globals (some n8n VM2 setups\n// don't expose them) and uses `this.helpers.httpRequest` for HTTP.\nconst cfg = $('Indexing Config').first().json;\nconst raw = $input.first().json;\nconst body = typeof raw === 'string' ? raw : (raw.data || raw.body || '');\n\nlet helpers = null;\ntry { if (this && this.helpers) helpers = this.helpers; } catch (e) {}\n\nconst allowPatterns = (cfg.allowPathPatterns || '').split(',').map(s => s.trim()).filter(Boolean);\nconst blockPatterns = (cfg.blockPathPatterns || '').split(',').map(s => s.trim()).filter(Boolean);\nconst localePrefixRe = /^\\/(fr|ar|en-uk|fr-uk|ar-uk|en-fr|fr-fr|ar-fr)(\\/|$)/i;\n\nfunction pathOf(url) {\n  if (typeof url !== 'string') return null;\n  const m = url.match(/^https?:\\/\\/[^\\/?#]+([^?#]*)/i);\n  return m ? (m[1] || '/') : null;\n}\n\nfunction allowed(url) {\n  const path = pathOf(url);\n  if (!path) return false;\n  if (localePrefixRe.test(path)) return false;\n  if (blockPatterns.some(p => path.startsWith(p))) return false;\n  if (allowPatterns.length === 0) return true;\n  return allowPatterns.some(p => path === p || path.startsWith(p));\n}\n\nfunction normalize(url) {\n  if (typeof url !== 'string') return null;\n  let s = url.trim();\n  if (!s) return null;\n  const hashIdx = s.indexOf('#');\n  if (hashIdx >= 0) s = s.slice(0, hashIdx);\n  if (!/^https?:\\/\\//i.test(s)) return null;\n  // Split path and query so we can normalize each independently.\n  const qIdx = s.indexOf('?');\n  let base = qIdx >= 0 ? s.slice(0, qIdx) : s;\n  let query = qIdx >= 0 ? s.slice(qIdx + 1) : '';\n  // Collapse /collections/<X>/products/<Y> -> /products/<Y> so collection-\n  // scoped product URLs dedupe to the canonical product URL.\n  const cp = base.match(/^(https?:\\/\\/[^\\/]+)\\/collections\\/[^\\/]+\\/products\\/([^\\/]+)/i);\n  if (cp) base = cp[1] + '/products/' + cp[2];\n  // Strip trailing slash from non-root paths so `/foo/` and `/foo` dedupe.\n  base = base.replace(/^(https?:\\/\\/[^\\/]+)\\/+$/i, '$1');\n  base = base.replace(/^(https?:\\/\\/[^\\/]+)(\\/.+?)\\/+$/i, '$1$2');\n  // For Shopify product/collection pages, drop ALL query params (variant=, etc).\n  // For other pages, only drop tracking params.\n  if (/\\/(products|collections)\\/[^\\/]+$/i.test(base)) {\n    query = '';\n  } else if (query) {\n    const drop = ['utm_source','utm_medium','utm_campaign','utm_content','utm_term','gclid','fbclid'];\n    const kept = query.split('&').filter(p => p && !drop.includes(p.split('=')[0]));\n    query = kept.join('&');\n  }\n  return query ? base + '?' + query : base;\n}\n\nfunction decodeXmlEntities(s) {\n  return String(s)\n    .replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&apos;/g, \"'\");\n}\n\nfunction extractEntries(xml, tag) {\n  const re = new RegExp('<' + tag + '\\\\b[^>]*>[\\\\s\\\\S]*?<\\\\/' + tag + '>', 'g');\n  const blocks = xml.match(re) || [];\n  const out = [];\n  for (const block of blocks) {\n    const loc = (block.match(/<loc>([^<]+)<\\/loc>/) || [])[1];\n    const lastmod = (block.match(/<lastmod>([^<]+)<\\/lastmod>/) || [])[1];\n    const priority = parseFloat((block.match(/<priority>([^<]+)<\\/priority>/) || [])[1] || '0.5');\n    if (loc) out.push({ loc: decodeXmlEntities(loc.trim()), lastmod: lastmod ? lastmod.trim() : null, priority });\n  }\n  return out;\n}\n\nasync function fetchXml(url) {\n  if (!helpers) return '';\n  const opts = {\n    method: 'GET',\n    url: url,\n    headers: { 'User-Agent': cfg.userAgent || 'MarbleBeeIndexerBot/1.0' },\n    returnFullResponse: false,\n  };\n  try {\n    if (typeof helpers.httpRequest === 'function') {\n      const res = await helpers.httpRequest(opts);\n      return typeof res === 'string' ? res : String(res || '');\n    }\n    if (typeof helpers.request === 'function') {\n      const res = await helpers.request({ method: 'GET', uri: url, headers: opts.headers, json: false });\n      return typeof res === 'string' ? res : String(res || '');\n    }\n    return '';\n  } catch (e) {\n    return '';\n  }\n}\n\nfunction ingestUrlset(xml, urls) {\n  const entries = extractEntries(xml, 'url');\n  for (const e of entries) {\n    const u = normalize(e.loc);\n    if (u && allowed(u) && !urls.has(u)) {\n      urls.set(u, { url: u, lastmod: e.lastmod, priority: e.priority, source: 'sitemap' });\n    }\n    if (urls.size >= cfg.maxPages) return;\n  }\n}\n\nconst urls = new Map();\n\nif (typeof body === 'string' && (body.includes('<urlset') || body.includes('<sitemapindex'))) {\n  if (body.includes('<sitemapindex')) {\n    const children = extractEntries(body, 'sitemap');\n    for (const c of children) {\n      if (urls.size >= cfg.maxPages) break;\n      const childPath = pathOf(c.loc);\n      if (childPath && localePrefixRe.test(childPath)) continue;\n      const childXml = await fetchXml(c.loc);\n      if (childXml) ingestUrlset(childXml, urls);\n    }\n  } else {\n    ingestUrlset(body, urls);\n  }\n}\n\n// Always include the home page so it never goes missing\nconst home = (cfg.siteBaseUrl || '').trim();\nif (home && /^https?:\\/\\//i.test(home) && !urls.has(home)) {\n  urls.set(home, { url: home, lastmod: null, priority: 1.0, source: 'seed' });\n}\n\nconst out = Array.from(urls.values())\n  .sort((a, b) => (b.priority || 0) - (a.priority || 0))\n  .slice(cfg.startPage || 0, (cfg.startPage || 0) + cfg.maxPages);\n\nreturn out.map(u => ({ json: u }));"
+      },
+      "id": "code-parse-sitemap",
+      "name": "Parse Sitemap → URL List",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 3. Per-page work (loop)\nFor each URL: fetch HTML, extract clean text + metadata, compute SHA-256 content hash. Then ask Supabase whether this hash is already stored — if it is, **skip** (no embeddings, no inserts).",
+        "height": 220,
+        "width": 1280,
+        "color": 5
+      },
+      "id": "note-perpage",
+      "name": "Section 3 Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -280,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": "={{ $('Indexing Config').first().json.batchSize }}",
+        "options": {}
+      },
+      "id": "split-batches",
+      "name": "Split In Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1320,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ (() => { const raw = ($json.url || '').replace(/[?#].*$/, '').replace(/\\/+$/, ''); const m = raw.match(/^(https?:\\/\\/[^\\/]+)\\/collections\\/[^\\/]+\\/products\\/([^\\/]+)$/); const canon = m ? (m[1] + '/products/' + m[2]) : raw; return /\\/(products|collections)\\/[^\\/?#]+$/.test(canon) ? (canon + '.json') : ($json.url || ''); })() }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $('Indexing Config').first().json.userAgent }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "fullResponse": true
+            }
+          },
+          "timeout": 12000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true
+            }
+          }
+        }
+      },
+      "id": "http-fetch-page",
+      "name": "Fetch Page HTML",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -220,
+        1080
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a clean indexable document. For Shopify product / collection JSON\n// endpoints, extract structured fields (title, description, price, variants)\n// and skip storefront chrome. For everything else, fall back to HTML strip.\n// Sandbox-safe: pure-JS hash, this.helpers.httpRequest only.\nlet urlInfo;\ntry { urlInfo = $('Split In Batches').item.json; } catch (e) {}\nif (!urlInfo || !urlInfo.url) { try { urlInfo = $('Split In Batches').context && $('Split In Batches').context.currentItem; } catch (e) {} }\nif (!urlInfo) urlInfo = $input.first().json || {};\n\nconst cfg = $('Indexing Config').first().json || {};\nconst raw = $input.first().json || {};\n\nconst bodyRaw = typeof raw.body === 'string' ? raw.body : (typeof raw.data === 'string' ? raw.data : (typeof raw === 'string' ? raw : ''));\nconst headers = (raw.headers || {});\nconst lastModifiedHttp = headers['last-modified'] || headers['Last-Modified'] || null;\nconst statusCode = raw.statusCode != null ? raw.statusCode : (raw.status != null ? raw.status : 200);\n\n// Canonicalize the page URL we record: strip query/fragment, trailing slash,\n// and collapse /collections/X/products/Y -> /products/Y so that variants and\n// collection-scoped product URLs dedupe to a single source row.\nfunction canonicalize(u) {\n  if (typeof u !== 'string') return u;\n  let s = u.replace(/[?#].*$/, '').replace(/\\/+$/, '');\n  const m = s.match(/^(https?:\\/\\/[^\\/]+)\\/collections\\/[^\\/]+\\/products\\/([^\\/]+)$/);\n  if (m) s = m[1] + '/products/' + m[2];\n  return s;\n}\n\nconst canonicalUrl = canonicalize(urlInfo.url);\nconst productMatch = canonicalUrl.match(/^https?:\\/\\/[^\\/]+\\/products\\/([^\\/?#]+)$/i);\nconst collectionMatch = canonicalUrl.match(/^https?:\\/\\/[^\\/]+\\/collections\\/([^\\/?#]+)$/i);\n\nlet helpers = null;\ntry { if (this && this.helpers) helpers = this.helpers; } catch (e) {}\n\nasync function fetchJson(url) {\n  if (!helpers || typeof helpers.httpRequest !== 'function') return null;\n  try {\n    const res = await helpers.httpRequest({\n      method: 'GET',\n      url: url,\n      headers: { 'User-Agent': cfg.userAgent || 'MarbleBeeIndexerBot/1.0' },\n      json: true,\n      returnFullResponse: false,\n    });\n    return res;\n  } catch (e) { return null; }\n}\n\nfunction tryParseJson(s) {\n  if (typeof s !== 'string') return null;\n  try { return JSON.parse(s); } catch (e) { return null; }\n}\n\nfunction htmlToText(html) {\n  let t = String(html || '');\n  t = t.replace(/<script[\\s\\S]*?<\\/script>/gi, ' ');\n  t = t.replace(/<style[\\s\\S]*?<\\/style>/gi, ' ');\n  t = t.replace(/<noscript[\\s\\S]*?<\\/noscript>/gi, ' ');\n  t = t.replace(/<!--[\\s\\S]*?-->/g, ' ');\n  // Block-level closes -> paragraph breaks (\\n\\n) so the splitter can keep\n  // each section in its own chunk and the title-prefix step below has natural\n  // boundaries to repeat the product name on.\n  t = t.replace(/<\\/(p|div|li|h[1-6]|tr|section|article)>/gi, '\\n\\n');\n  t = t.replace(/<br\\s*\\/?>/gi, '\\n');\n  t = t.replace(/<[^>]+>/g, ' ');\n  t = t\n    .replace(/&nbsp;/g, ' ')\n    .replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#39;/g, \"'\")\n    .replace(/&[a-z]+;/gi, ' ');\n  // Trim each line, drop pure-whitespace lines, then collapse 3+ blank lines\n  // into a single paragraph break.\n  return t.split('\\n').map(l => l.replace(/[ \\t]+/g, ' ').trim()).join('\\n')\n    .replace(/\\n{3,}/g, '\\n\\n').replace(/^\\s+|\\s+$/g, '');\n}\n\nfunction fmtMoney(n) {\n  if (n == null || n === '') return null;\n  const v = Number(n);\n  if (!isFinite(v)) return null;\n  return v.toFixed(2);\n}\n\nfunction cyrb128(str) {\n  let h1 = 1779033703, h2 = 3144134277, h3 = 1013904242, h4 = 2773480762;\n  for (let i = 0; i < str.length; i++) {\n    const k = str.charCodeAt(i);\n    h1 = h2 ^ Math.imul(h1 ^ k, 597399067);\n    h2 = h3 ^ Math.imul(h2 ^ k, 2869860233);\n    h3 = h4 ^ Math.imul(h3 ^ k, 951274213);\n    h4 = h1 ^ Math.imul(h4 ^ k, 2716044179);\n  }\n  h1 = Math.imul(h3 ^ (h1 >>> 18), 597399067);\n  h2 = Math.imul(h4 ^ (h2 >>> 22), 2869860233);\n  h3 = Math.imul(h1 ^ (h3 >>> 17), 951274213);\n  h4 = Math.imul(h2 ^ (h4 >>> 19), 2716044179);\n  h1 ^= (h2 ^ h3 ^ h4); h2 ^= h1; h3 ^= h1; h4 ^= h1;\n  return [h1 >>> 0, h2 >>> 0, h3 >>> 0, h4 >>> 0]\n    .map(n => n.toString(16).padStart(8, '0')).join('');\n}\n\nif (statusCode >= 400 || !bodyRaw) {\n  return [{ json: { url: canonicalUrl, skip: true, skipReason: `fetch failed (status ${statusCode})` } }];\n}\n\nconst json = tryParseJson(bodyRaw);\nconst isProductJson = !!(json && json.product && typeof json.product === 'object');\nconst isCollectionJson = !!(json && json.collection && typeof json.collection === 'object');\n\n// --- PRODUCT branch: structured Shopify product ---\nif (productMatch && isProductJson) {\n  const p = json.product;\n  const title = (p.title || '').trim();\n  const vendor = (p.vendor || '').trim();\n  const productType = (p.product_type || '').trim();\n  const tags = (typeof p.tags === 'string'\n    ? p.tags.split(',').map(s => s.trim()).filter(Boolean)\n    : (Array.isArray(p.tags) ? p.tags : []));\n  const bodyText = htmlToText(p.body_html || '');\n\n  const variants = Array.isArray(p.variants) ? p.variants : [];\n  const prices = variants.map(v => Number(v && v.price)).filter(n => isFinite(n) && n > 0);\n  const priceMin = prices.length ? Math.min(...prices) : null;\n  const priceMax = prices.length ? Math.max(...prices) : null;\n\n  const lines = [];\n  if (title) lines.push(`# ${title}`);\n  if (priceMin != null) {\n    if (priceMax != null && priceMax !== priceMin) {\n      lines.push(`Price: $${fmtMoney(priceMin)} – $${fmtMoney(priceMax)}`);\n    } else {\n      lines.push(`Price: $${fmtMoney(priceMin)}`);\n    }\n  }\n  if (vendor) lines.push(`Vendor: ${vendor}`);\n  if (productType) lines.push(`Product type: ${productType}`);\n  if (tags.length) lines.push(`Tags: ${tags.join(', ')}`);\n  if (variants.length > 1) {\n    const variantLines = variants.map(v => {\n      const name = (v && v.title && v.title !== 'Default Title') ? v.title : null;\n      const price = fmtMoney(v && v.price);\n      const sku = v && v.sku;\n      const parts = [];\n      if (name) parts.push(name);\n      if (price) parts.push('$' + price);\n      if (sku) parts.push('SKU ' + sku);\n      return parts.length ? '- ' + parts.join(' — ') : null;\n    }).filter(Boolean);\n    if (variantLines.length) {\n      lines.push('');\n      lines.push('Variants:');\n      lines.push(...variantLines);\n    }\n  }\n  if (bodyText) {\n    // Prefix every paragraph with the product title so each chunk the\n    // downstream splitter produces still contains the product name.\n    // Without this, FTS misses compound queries like \"Triangle stone basin\n    // weight\" because the weight line and the title end up in different chunks.\n    const titlePrefix = title ? `# ${title} \\u2014 ` : '';\n    const paragraphs = bodyText.split(/\\n\\n+/);\n    for (const para of paragraphs) {\n      const trimmed = para.trim();\n      if (!trimmed) continue;\n      lines.push('');\n      lines.push(titlePrefix + trimmed);\n    }\n  }\n\n  const composed = lines.join('\\n');\n  if (composed.length < 40) {\n    return [{ json: { url: canonicalUrl, skip: true, skipReason: 'product doc too small' } }];\n  }\n\n  const productHandle = p.handle || productMatch[1];\n  const lastModified = p.updated_at || p.created_at || lastModifiedHttp || urlInfo.lastmod || null;\n\n  return [{\n    json: {\n      url: canonicalUrl,\n      page_title: title || null,\n      meta_description: null,\n      last_modified: lastModified,\n      content: composed,\n      content_hash: cyrb128(composed),\n      char_count: composed.length,\n      doc_type: 'product',\n      product_handle: productHandle,\n      collection_handle: null,\n      price_min: priceMin,\n      price_max: priceMax,\n      skip: false\n    }\n  }];\n}\n\n// --- COLLECTION branch: collection metadata + product roster ---\nif (collectionMatch && isCollectionJson) {\n  const c = json.collection;\n  const title = (c.title || '').trim();\n  const bodyText = htmlToText(c.body_html || '');\n  const handle = c.handle || collectionMatch[1];\n\n  const limit = Number(cfg.collectionProductsLimit) || 250;\n  const origin = (canonicalUrl.match(/^(https?:\\/\\/[^\\/]+)/) || [])[1] || '';\n  const productsUrl = origin + '/collections/' + handle + '/products.json?limit=' + limit;\n  let prodList = [];\n  const productsResp = await fetchJson(productsUrl);\n  if (productsResp && Array.isArray(productsResp.products)) {\n    prodList = productsResp.products;\n  }\n\n  const lines = [];\n  if (title) lines.push(`# ${title}`);\n  if (bodyText) {\n    // Prefix every paragraph with the collection title (same reasoning as products).\n    const titlePrefix = title ? `# ${title} \\u2014 ` : '';\n    const paragraphs = bodyText.split(/\\n\\n+/);\n    for (const para of paragraphs) {\n      const trimmed = para.trim();\n      if (!trimmed) continue;\n      lines.push('');\n      lines.push(titlePrefix + trimmed);\n    }\n  }\n  if (prodList.length) {\n    lines.push('');\n    lines.push('Products in this collection:');\n    for (const pr of prodList) {\n      const t = (pr.title || '').trim();\n      if (!t) continue;\n      const variants = Array.isArray(pr.variants) ? pr.variants : [];\n      const prices = variants.map(v => Number(v && v.price)).filter(n => isFinite(n) && n > 0);\n      const pmin = prices.length ? Math.min(...prices) : null;\n      const pmax = prices.length ? Math.max(...prices) : null;\n      const phandle = pr.handle || '';\n      const purl = origin + '/products/' + phandle;\n      let priceStr = '';\n      if (pmin != null) {\n        priceStr = (pmax != null && pmax !== pmin)\n          ? ` — $${fmtMoney(pmin)}–$${fmtMoney(pmax)}`\n          : ` — $${fmtMoney(pmin)}`;\n      }\n      lines.push(`- ${t}${priceStr} — ${purl}`);\n    }\n  }\n\n  const composed = lines.join('\\n');\n  if (composed.length < 40) {\n    return [{ json: { url: canonicalUrl, skip: true, skipReason: 'collection doc too small' } }];\n  }\n\n  const lastModified = c.updated_at || lastModifiedHttp || urlInfo.lastmod || null;\n\n  return [{\n    json: {\n      url: canonicalUrl,\n      page_title: title || null,\n      meta_description: null,\n      last_modified: lastModified,\n      content: composed,\n      content_hash: cyrb128(composed),\n      char_count: composed.length,\n      doc_type: 'collection',\n      product_handle: null,\n      collection_handle: handle,\n      price_min: null,\n      price_max: null,\n      skip: false\n    }\n  }];\n}\n\n// --- HTML fallback for non-Shopify-JSON pages (home, /pages/*, blog) ---\nconst html = bodyRaw;\nconst titleMatch = html.match(/<title[^>]*>([\\s\\S]*?)<\\/title>/i);\nconst pageTitle = (titleMatch ? titleMatch[1] : '').replace(/\\s+/g, ' ').trim();\nconst descMatch = html.match(/<meta\\s+name=[\"']description[\"']\\s+content=[\"']([^\"']+)[\"']/i);\nconst metaDescription = descMatch ? descMatch[1].trim() : '';\nconst text = htmlToText(html);\nif (text.length < 80) {\n  return [{ json: { url: canonicalUrl, skip: true, skipReason: 'empty or nearly empty body' } }];\n}\nconst composed = [pageTitle && `# ${pageTitle}`, metaDescription, text].filter(Boolean).join('\\n\\n');\n\nreturn [{\n  json: {\n    url: canonicalUrl,\n    page_title: pageTitle || null,\n    meta_description: metaDescription || null,\n    last_modified: urlInfo.lastmod || lastModifiedHttp || null,\n    content: composed,\n    content_hash: cyrb128(composed),\n    char_count: composed.length,\n    doc_type: 'page',\n    product_handle: null,\n    collection_handle: null,\n    price_min: null,\n    price_max: null,\n    skip: false\n  }\n}];\n"
+      },
+      "id": "code-extract",
+      "name": "Extract Text + Hash",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        40,
+        1080
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Supabase Config').first().json.supabaseUrl }}/rest/v1/marblebee_sources",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $('Supabase Config').first().json.serviceRoleKey }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Supabase Config').first().json.serviceRoleKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=representation"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "on_conflict",
+              "value": "url"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ url: $('Extract Text + Hash').item.json.url, content_hash: $('Extract Text + Hash').item.json.content_hash, page_title: $('Extract Text + Hash').item.json.page_title, last_modified: $('Extract Text + Hash').item.json.last_modified || null, last_indexed_at: $now.toISO(), status: 'active' }) }}",
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "id": "http-upsert-source",
+      "name": "Upsert Source Record",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        560,
+        1080
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Supabase Config').first().json.supabaseUrl }}/rest/v1/rpc/delete_marblebee_chunks_by_source",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $('Supabase Config').first().json.serviceRoleKey }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Supabase Config').first().json.serviceRoleKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={ \"p_source_url\": {{ JSON.stringify($json.url) }} }",
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "id": "http-delete-chunks",
+      "name": "Delete Old Chunks",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        320,
+        1080
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "supabase-url",
+              "name": "supabaseUrl",
+              "value": "={{ $env.SUPABASE_URL }}",
+              "type": "string"
+            },
+            {
+              "id": "service-key",
+              "name": "serviceRoleKey",
+              "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}",
+              "type": "string"
+            },
+            {
+              "id": "table-name",
+              "name": "tableName",
+              "value": "marblebee_documents",
+              "type": "string"
+            },
+            {
+              "id": "embed-model",
+              "name": "embeddingModel",
+              "value": "text-embedding-3-small",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "set-supabase-config",
+      "name": "Supabase Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -220,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 4. Embedding & vector storage (LangChain pipeline)\nThree sub-nodes feed into the Vector Store Insert via `ai_*` connections:\n- **Recursive Splitter** chunks ~512 tokens with 64-token overlap\n- **Document Loader** wraps text + metadata for the chain\n- **Embeddings** uses `text-embedding-3-small` (1536d, $0.02 / 1M tokens)\n\nThe Vector Store node then writes rows into `marblebee_documents`.",
+        "height": 240,
+        "width": 1100,
+        "color": 5
+      },
+      "id": "note-embed",
+      "name": "Section 4 Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        780,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "doc-url",
+              "name": "url",
+              "value": "={{ $('Extract Text + Hash').item.json.url }}",
+              "type": "string"
+            },
+            {
+              "id": "doc-content",
+              "name": "content",
+              "value": "={{ $('Extract Text + Hash').item.json.content }}",
+              "type": "string"
+            },
+            {
+              "id": "doc-page-title",
+              "name": "page_title",
+              "value": "={{ $('Extract Text + Hash').item.json.page_title || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "doc-last-modified",
+              "name": "last_modified",
+              "value": "={{ $('Extract Text + Hash').item.json.last_modified || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "doc-char-count",
+              "name": "char_count",
+              "value": "={{ $('Extract Text + Hash').item.json.char_count }}",
+              "type": "number"
+            },
+            {
+              "id": "doc-doc-type",
+              "name": "doc_type",
+              "value": "={{ $('Extract Text + Hash').item.json.doc_type || 'page' }}",
+              "type": "string"
+            },
+            {
+              "id": "doc-product-handle",
+              "name": "product_handle",
+              "value": "={{ $('Extract Text + Hash').item.json.product_handle || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "doc-collection-handle",
+              "name": "collection_handle",
+              "value": "={{ $('Extract Text + Hash').item.json.collection_handle || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "doc-price-min",
+              "name": "price_min",
+              "value": "={{ $('Extract Text + Hash').item.json.price_min != null ? $('Extract Text + Hash').item.json.price_min : '' }}",
+              "type": "string"
+            },
+            {
+              "id": "doc-price-max",
+              "name": "price_max",
+              "value": "={{ $('Extract Text + Hash').item.json.price_max != null ? $('Extract Text + Hash').item.json.price_max : '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "prepare-document",
+      "name": "Prepare Document",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        700,
+        1080
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "insert",
+        "tableName": {
+          "__rl": true,
+          "value": "marblebee_documents",
+          "mode": "list",
+          "cachedResultName": "marblebee_documents"
+        },
+        "options": {
+          "queryName": "match_marblebee_documents"
+        }
+      },
+      "id": "vector-insert",
+      "name": "Vector Store Insert (Supabase)",
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreSupabase",
+      "typeVersion": 1.1,
+      "position": [
+        840,
+        1080
+      ]
+    },
+    {
+      "parameters": {
+        "dataType": "json",
+        "jsonMode": "expressionData",
+        "jsonData": "={{ $json.content }}",
+        "options": {
+          "metadata": {
+            "metadataValues": [
+              {
+                "name": "source_url",
+                "value": "={{ $json.url }}"
+              },
+              {
+                "name": "page_title",
+                "value": "={{ $json.page_title || '' }}"
+              },
+              {
+                "name": "last_modified",
+                "value": "={{ $json.last_modified || '' }}"
+              },
+              {
+                "name": "indexed_at",
+                "value": "={{ $now.toISO() }}"
+              },
+              {
+                "name": "char_count",
+                "value": "={{ $json.char_count }}"
+              },
+              {
+                "name": "doc_type",
+                "value": "={{ $json.doc_type || 'page' }}"
+              },
+              {
+                "name": "product_handle",
+                "value": "={{ $json.product_handle || '' }}"
+              },
+              {
+                "name": "collection_handle",
+                "value": "={{ $json.collection_handle || '' }}"
+              },
+              {
+                "name": "price_min",
+                "value": "={{ $json.price_min }}"
+              },
+              {
+                "name": "price_max",
+                "value": "={{ $json.price_max }}"
+              }
+            ]
+          }
+        }
+      },
+      "id": "doc-loader",
+      "name": "Document Loader",
+      "type": "@n8n/n8n-nodes-langchain.documentDefaultDataLoader",
+      "typeVersion": 1,
+      "position": [
+        820,
+        1320
+      ]
+    },
+    {
+      "parameters": {
+        "chunkSize": 1500,
+        "chunkOverlap": 200,
+        "options": {
+          "separators": [
+            "\n\n",
+            "\n",
+            ". ",
+            " ",
+            ""
+          ]
+        }
+      },
+      "id": "splitter",
+      "name": "Recursive Splitter",
+      "type": "@n8n/n8n-nodes-langchain.textSplitterRecursiveCharacterTextSplitter",
+      "typeVersion": 1,
+      "position": [
+        820,
+        1540
+      ]
+    },
+    {
+      "parameters": {
+        "model": "text-embedding-3-small",
+        "options": {
+          "batchSize": 200,
+          "stripNewLines": true
+        }
+      },
+      "id": "embeddings",
+      "name": "Embeddings (OpenAI)",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        1060,
+        1320
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 5. Reporting\nAfter all batches complete, aggregate stats and email an indexing report. Logs are stored in Supabase via the query log table for the evaluation workflow to consume.",
+        "height": 200,
+        "width": 760,
+        "color": 5
+      },
+      "id": "note-report",
+      "name": "Section 5 Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1900,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate per-page results into a final report.\nconst items = $input.all();\nconst pagesAttempted = items.length;\nconst pagesIndexed = items.filter(i => !i.json.skip).length;\nconst pagesSkipped = items.filter(i => i.json.skip).length;\nconst totalChars = items.reduce((s, i) => s + (i.json.char_count || 0), 0);\n// Estimate: text-embedding-3-small is ~$0.02 per 1M tokens, ~4 chars/token\nconst estTokens = Math.round(totalChars / 4);\nconst estCostUsd = +(estTokens / 1_000_000 * 0.02).toFixed(4);\nconst startedAt = $('Indexing Config').first().json.startedAt;\nconst durationSeconds = Math.round((Date.now() - new Date(startedAt).getTime()) / 1000);\n\nconst skippedDetail = items.filter(i => i.json.skip)\n  .map(i => `${i.json.url} — ${i.json.skipReason}`)\n  .slice(0, 20);\n\nreturn [{\n  json: {\n    pagesAttempted,\n    pagesIndexed,\n    pagesSkipped,\n    totalChars,\n    estTokens,\n    estCostUsd,\n    durationSeconds,\n    skippedDetail,\n    startedAt,\n    finishedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-aggregate",
+      "name": "Aggregate Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        1080
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $env.NOTIFICATION_EMAIL }}",
+        "subject": "=MarbleBee RAG indexing report — {{ $json.pagesIndexed }}/{{ $json.pagesAttempted }} pages",
+        "emailType": "html",
+        "message": "=<div style=\"font-family:Arial,sans-serif;max-width:640px\">\n  <h2 style=\"color:#1a73e8\">MarbleBee Knowledge Index — Refresh Report</h2>\n  <table style=\"border-collapse:collapse;width:100%;margin-top:16px\">\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7;width:200px\"><strong>Pages attempted</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ $json.pagesAttempted }}</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>Pages indexed (changed)</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ $json.pagesIndexed }}</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>Pages skipped</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ $json.pagesSkipped }}</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>Total content size</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ ($json.totalChars/1000).toFixed(1) }} KB</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>Estimated tokens</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ $json.estTokens.toLocaleString() }}</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>Estimated cost</strong></td><td style=\"padding:8px;border:1px solid #eee\">${{ $json.estCostUsd }}</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>Runtime</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ $json.durationSeconds }} s</td></tr>\n  </table>\n  <p style=\"color:#888;font-size:12px;margin-top:24px\">Sent by the MarbleBee RAG indexing pipeline.</p>\n</div>",
+        "options": {}
+      },
+      "id": "email-report",
+      "name": "Email Indexing Report",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2200,
+        1080
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "skip-check",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-should-index",
+      "name": "Should Index?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        200,
+        1080
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Indexing Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule (Daily 03:00)": {
+      "main": [
+        [
+          {
+            "node": "Indexing Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Indexing Config": {
+      "main": [
+        [
+          {
+            "node": "Supabase Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase Config": {
+      "main": [
+        [
+          {
+            "node": "Fetch Sitemap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Sitemap": {
+      "main": [
+        [
+          {
+            "node": "Parse Sitemap → URL List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Sitemap → URL List": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split In Batches": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Report",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch Page HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Page HTML": {
+      "main": [
+        [
+          {
+            "node": "Extract Text + Hash",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Text + Hash": {
+      "main": [
+        [
+          {
+            "node": "Should Index?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Index?": {
+      "main": [
+        [
+          {
+            "node": "Delete Old Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Old Chunks": {
+      "main": [
+        [
+          {
+            "node": "Upsert Source Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Source Record": {
+      "main": [
+        [
+          {
+            "node": "Prepare Document",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Document": {
+      "main": [
+        [
+          {
+            "node": "Vector Store Insert (Supabase)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vector Store Insert (Supabase)": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Document Loader": {
+      "ai_document": [
+        [
+          {
+            "node": "Vector Store Insert (Supabase)",
+            "type": "ai_document",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recursive Splitter": {
+      "ai_textSplitter": [
+        [
+          {
+            "node": "Document Loader",
+            "type": "ai_textSplitter",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings (OpenAI)": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Vector Store Insert (Supabase)",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Report": {
+      "main": [
+        [
+          {
+            "node": "Email Indexing Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    {
+      "name": "rag"
+    },
+    {
+      "name": "indexing"
+    },
+    {
+      "name": "marblebee"
+    }
+  ]
+}

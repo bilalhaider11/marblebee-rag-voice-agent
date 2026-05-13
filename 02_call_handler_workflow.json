@@ -1,0 +1,2415 @@
+{
+  "name": "MarbleBee RAG — 02 Call Handler (Voice → Retrieval → Answer)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Call Handler — production RAG over voice\n\n**What this workflow does:**\n1. Twilio routes a call into n8n. We greet the caller and gather their spoken question.\n2. We **rewrite** the noisy phone transcript into a clean search query (LLM, fast model).\n3. We **embed** the rewritten query and run a **hybrid search** (vector + BM25) against the Supabase index built by workflow `01_indexing_workflow.json`.\n4. We **diversify** retrievals (no more than 2 chunks per source URL) and build a context block annotated with source URLs.\n5. We send the question + retrieved chunks to GPT-4o-mini with strict instructions: *answer only from these chunks, return confidence and sources*.\n6. We enforce a 0.9 confidence floor in the parser. Below it → escalate.\n7. Every call is logged to Supabase (`marblebee_query_log`) so retrieval quality can be measured and improved over time.\n\n**Webhooks exposed:**\n- `/webhook/incoming-call` — initial Twilio voice webhook\n- `/webhook/process-speech` — speech transcription callback\n\n**Failure modes are handled:**\n- Vector store unreachable → AI returns no-context, escalates\n- LLM timeout → escalation TwiML keeps the call alive\n- Sheets / Email failures → call still completes (continueOnFail)\n- Query log failure → does not block the response",
+        "height": 380,
+        "width": 1300,
+        "color": 4
+      },
+      "id": "04b752ca-1c0a-4ff5-b772-b5f3dbdc00f1",
+      "name": "Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        56736,
+        48080
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 1. Inbound call & off-hours decision",
+        "height": 460,
+        "width": 1400,
+        "color": 5
+      },
+      "id": "6fdfe29e-f19e-4c55-8751-6329449f4aef",
+      "name": "Section 1 Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        56736,
+        48464
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "incoming-call",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "id": "1463481c-25f0-41ff-a346-0aefa6cfb9b2",
+      "name": "Twilio: Incoming Call",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        56800,
+        48688
+      ],
+      "webhookId": "marblebee-rag-incoming-call"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Off-hours check (NYC time). During business hours we forward to a real human.\nconst TIMEZONE = 'America/New_York';\nconst BUSINESS_HOURS = {\n  1: { open: 9, close: 18 }, 2: { open: 9, close: 18 }, 3: { open: 9, close: 18 },\n  4: { open: 9, close: 18 }, 5: { open: 9, close: 18 }, 6: { open: 10, close: 16 }\n};\nconst LIVE_AGENT_NUMBER = $env.LIVE_AGENT_NUMBER || '';\n\nconst now = new Date(new Date().toLocaleString('en-US', { timeZone: TIMEZONE }));\nconst day = now.getDay();\nconst hour = now.getHours();\nconst window = BUSINESS_HOURS[day];\nconst isBusinessHours = !!window && hour >= window.open && hour < window.close;\nconst body = $input.first().json.body || $input.first().json;\n\nreturn [{ json: {\n  isBusinessHours, isOffHours: !isBusinessHours, liveAgentNumber: LIVE_AGENT_NUMBER,\n  callSid: body.CallSid || null, fromNumber: body.From || null, toNumber: body.To || null\n}}];"
+      },
+      "id": "15097acc-8206-4619-82cf-a9da8efed68e",
+      "name": "Check Business Hours",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        57056,
+        48688
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "off-hours",
+              "leftValue": "={{ $json.isOffHours }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "045b873c-ebc3-41a3-81ee-47a3d8c2d32c",
+      "name": "Off-Hours?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        57312,
+        48688
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const gatherUrl = ($env.N8N_BASE_URL || '').replace(/\\/$/, '') + '/webhook/process-speech';\nconst twiml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response>\n  <Say voice=\"Polly.Joanna-Neural\">Thank you for calling MarbleBee. Our office is currently closed, but our AI assistant can help you with orders, products, pricing, and delivery questions.</Say>\n  <Gather input=\"speech\" action=\"${gatherUrl}\" method=\"POST\" speechTimeout=\"3\" timeout=\"8\" actionOnEmptyResult=\"true\" speechModel=\"phone_call\" hints=\"Marblebee, Calacatta, Calacatta Viola, Calacatta Monet, Calacatta Rosa, Carrara, Arabescato, Marquina, Volakas, Moon White, Italian Valgri, Travertine, Riverstone, marble bathtub, stone bathtub, designer bathtub, freestanding bathtub, triangle stone basin, marble fountain, marble fireplace, fireplace mantel, marble vanity, marble washbasin, stone sink, marble statue, river vein sandstone, granite, limestone, quartz\" language=\"en-US\">\n    <Say voice=\"Polly.Joanna-Neural\">Please go ahead and tell me what you need help with.</Say>\n  </Gather>\n  <Say voice=\"Polly.Joanna-Neural\">We did not receive any input. Goodbye.</Say>\n  <Hangup/>\n</Response>`;\nreturn [{ json: { twiml } }];"
+      },
+      "id": "9852caf5-e5f1-4573-bc75-f2e35d1f6795",
+      "name": "Build Off-Hours Greeting",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        57568,
+        48560
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.twiml }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/xml"
+              }
+            ]
+          }
+        }
+      },
+      "id": "22c56aac-11d1-44c0-9221-b870268b48af",
+      "name": "Respond TwiML (Off-Hours)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        57824,
+        48560
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const liveNumber = $json.liveAgentNumber;\nconst twiml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response>\n  <Say voice=\"Polly.Joanna-Neural\">Connecting you to our team. Please hold.</Say>\n  <Dial timeout=\"25\" callerId=\"${$json.toNumber || ''}\">${liveNumber}</Dial>\n</Response>`;\nreturn [{ json: { twiml } }];"
+      },
+      "id": "dac30b3d-cac6-4231-bbb3-98e3c4197068",
+      "name": "Build Forward TwiML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        57568,
+        48800
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.twiml }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/xml"
+              }
+            ]
+          }
+        }
+      },
+      "id": "073f6b99-810f-4ab9-96be-7dacc0815585",
+      "name": "Respond TwiML (Forward)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        57824,
+        48800
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 2. Speech → Query Rewrite → Embed → Hybrid Search → Diversify → Generate → Log\nThis is the production RAG pipeline. Each step has a single responsibility, and any single failure escalates instead of crashing the call.",
+        "height": 590,
+        "width": 7912,
+        "color": 5
+      },
+      "id": "04200a9d-19df-4c32-bb2e-0537614be49e",
+      "name": "Section 2 Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        56736,
+        49360
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "process-speech",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "b0d9103a-1999-4075-85a8-df8b31a57aaa",
+      "name": "Twilio: Speech Result",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        56800,
+        49488
+      ],
+      "webhookId": "marblebee-rag-process-speech"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "t-1",
+              "name": "transcript",
+              "value": "={{ $json.body?.SpeechResult || $json.SpeechResult || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "c-1",
+              "name": "speechConfidence",
+              "value": "={{ parseFloat($json.body?.Confidence || $json.Confidence || '0') }}",
+              "type": "number"
+            },
+            {
+              "id": "s-1",
+              "name": "callSid",
+              "value": "={{ $json.body?.CallSid || $json.CallSid || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "f-1",
+              "name": "fromNumber",
+              "value": "={{ $json.body?.From || $json.From || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "started",
+              "name": "startedAt",
+              "value": "={{ $now.toISO() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "17921653-603a-46e1-ba7f-2ba5fa5639e8",
+      "name": "Extract Speech Fields",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        57056,
+        49488
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "call-sid",
+              "name": "callSid",
+              "value": "={{ $('Extract Speech Fields').first().json.callSid }}",
+              "type": "string"
+            },
+            {
+              "id": "sb-url",
+              "name": "supabaseUrl",
+              "value": "={{ $env.SUPABASE_URL }}",
+              "type": "string"
+            },
+            {
+              "id": "sb-key",
+              "name": "serviceRoleKey",
+              "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}",
+              "type": "string"
+            },
+            {
+              "id": "topk",
+              "name": "topK",
+              "value": 5,
+              "type": "number"
+            },
+            {
+              "id": "max-per-source",
+              "name": "maxChunksPerSource",
+              "value": 2,
+              "type": "number"
+            },
+            {
+              "id": "conf-threshold",
+              "name": "confidenceThreshold",
+              "value": 0.85,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "1e12c6d7-0663-4e7f-a6d5-4bffd5778688",
+      "name": "RAG Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        58592,
+        49488
+      ]
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "responses": {
+          "values": [
+            {
+              "content": "=You rewrite noisy phone-call transcripts into 2 to 3 distinct search queries for MarbleBee, a wholesale marble, granite, and quartz supplier. Each query MUST be under 15 words.\n\nRules:\n1. Strip ONLY genuine filler (\"um\", \"uh\", \"you know\", \"like I said\", greetings, polite scaffolding). Do NOT strip:\n   - Adjectives that look generic but might be part of a product name: 'unique', 'designer', 'luxury', 'custom', 'premium', 'classic', 'modern'.\n   - Numbers, dimensions, sizes, colors, materials.\n   - Anything that looks like it could be part of a SKU, model name, or product line. When in doubt, KEEP it.\n2. Normalize obvious mishearings/phonetic spellings to standard terms (e.g. 'black sparkly stone' -> 'Black Galaxy granite', 'kalakata' -> 'Calacatta'). Do NOT rename anything if you're not confident — keep the caller's wording.\n3. If the question has multiple intents (e.g. 'do you have X AND can I get Y made'), DECOMPOSE into one query per intent.\n4. Include at least one paraphrase variant of the main intent (different phrasing helps retrieval).\n5. Avoid trivially redundant variants — each one should retrieve genuinely different content.\n6. CONTEXT RESOLUTION: classify the current turn as either a FOLLOW-UP or a TOPIC SWITCH using PRIOR CONVERSATION and PRIOR SOURCES below.\n   - **FOLLOW-UP** — the caller's current turn uses a pronoun ('it', 'that', 'this', 'them', 'those'), is a fragment with no product/material/topic of its own ('what's the price?', 'how much?', 'in stock?', 'how heavy is it?', 'what about delivery?'), or otherwise clearly continues the prior thread. Treat the turn as if the caller had explicitly named the prior subject. Extract the subject from PRIOR CONVERSATION; if PRIOR SOURCES contains URLs like `/products/triangle-stone-basin` or `/collections/marble-bathtub`, use the slug ('triangle stone basin', 'marble bathtub') to anchor at least two variants. Example: prior turn was about Calacatta marble, caller now says 'what sizes does it come in' — variants: 'Calacatta marble slab sizes', 'Calacatta marble dimensions'.\n   - **TOPIC SWITCH** — the caller's current turn explicitly names a different product, material, color, or category from anything in prior conversation (e.g. prior was 'white marble', caller now says 'do you have a Calacatta bathtub?'). IGNORE prior conversation and prior sources entirely. Variants must be only about the new subject. Do NOT carry forward the previous topic.\n   - NEVER emit a query that contains an unresolved pronoun.\n7. AT LEAST ONE variant SHOULD include the most distinguishing nouns/identifiers/dimensions from the caller's wording, even if they sound like filler. For example, if the caller says 'unique designer marble bathtub 70 inches', one variant should literally include 'unique designer marble bathtub' and another should include the dimension '70 inches'. The exact wording often matches the catalog's product titles.\n\nReply ONLY with JSON. Schema:\n{\"rewritten\": [\"q1\", \"q2\"]}\n\nPRIOR CONVERSATION (oldest to newest, may be empty for first turn):\n{{ $('Format History').first().json.historyText || '(no prior turns)' }}\n\nPRIOR SOURCES (canonical URLs cited in the most recent assistant turn — use only when the current turn is a FOLLOW-UP):\n{{ $('Format History').first().json.priorSourcesText || '(none)' }}\n\nCALLER SAID: {{ $('Extract Speech Fields').first().json.transcript || 'no speech detected' }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "id": "35195558-1ddc-4ab3-a2d9-d81f30f81a07",
+      "name": "Query Rewrite (LLM)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [
+        60896,
+        49648
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "vqyuT7cErwUg10ar",
+          "name": "OpenAI account"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract the array of rewritten search queries from the LLM output, then\n// always append the caller's literal transcript as a final variant. The literal\n// variant guarantees FTS gets a shot at exact-phrase matching even if the\n// rewriter strips a distinguishing word — at the cost of one extra RPC call.\nconst out = $input.first().json;\nconst literalTranscript = ($('Extract Speech Fields').first().json.transcript || '').trim();\nconst fallback = literalTranscript || 'general inquiry';\n\nfunction getText(j) {\n  if (!j) return null;\n  if (typeof j.output_text === 'string') return j.output_text;\n  if (typeof j.text === 'string') return j.text;\n  if (typeof j.content === 'string') return j.content;\n  if (typeof j.message?.content === 'string') return j.message.content;\n  if (Array.isArray(j.output)) {\n    for (const item of j.output) {\n      if (Array.isArray(item?.content)) {\n        for (const c of item.content) {\n          if (typeof c?.text === 'string') return c.text;\n        }\n      }\n    }\n  }\n  if (typeof j.choices?.[0]?.message?.content === 'string') return j.choices[0].message.content;\n  return null;\n}\n\nfunction tryParse(s) {\n  if (typeof s !== 'string') return null;\n  const cleaned = s.trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '').trim();\n  try { return JSON.parse(cleaned); } catch { return null; }\n}\n\nfunction normalizeRewritten(value) {\n  if (Array.isArray(value)) return value;\n  if (typeof value === 'string') return [value];\n  return [];\n}\n\nlet rewritten = [];\nif (out) {\n  if (Array.isArray(out.rewritten) || typeof out.rewritten === 'string') {\n    rewritten = normalizeRewritten(out.rewritten);\n  } else {\n    const parsed = tryParse(getText(out));\n    if (parsed && (Array.isArray(parsed.rewritten) || typeof parsed.rewritten === 'string')) {\n      rewritten = normalizeRewritten(parsed.rewritten);\n    }\n  }\n}\n\nrewritten = rewritten\n  .map(s => (typeof s === 'string' ? s.trim() : ''))\n  .filter(Boolean);\n\n// Always include the caller's literal transcript so FTS sees exact tokens —\n// rewriters tend to strip identifying-but-uncommon words like product names.\nif (literalTranscript) rewritten.push(literalTranscript);\n\n// Dedupe (case-insensitive) while preserving order.\nconst seen = new Set();\nrewritten = rewritten.filter(q => {\n  const k = q.toLowerCase();\n  if (seen.has(k)) return false;\n  seen.add(k);\n  return true;\n});\n\nif (rewritten.length === 0) rewritten = [fallback];\n\nreturn [{ json: { rewritten, variantCount: rewritten.length, literalIncluded: !!literalTranscript } }];"
+      },
+      "id": "ad2cc3f9-48ff-44c6-8496-d19b2295898e",
+      "name": "Extract Rewritten",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        61152,
+        49648
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"text-embedding-3-small\",\n  \"input\": {{ JSON.stringify($json.rewritten || $('Extract Speech Fields').first().json.transcript || 'general inquiry') }}\n}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 10,
+              "batchInterval": 0
+            }
+          },
+          "timeout": 4000
+        }
+      },
+      "id": "d1c85e00-4a8a-47bd-bc4c-8e9265b90f65",
+      "name": "Embed Query",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        61408,
+        49648
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "vqyuT7cErwUg10ar",
+          "name": "OpenAI account"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fan out one item per (query, embedding) pair. The downstream HTTP node will\n// make one RPC call per item; Fuse Retrievals collects all responses via\n// $input.all() and does the RRF merge.\nconst queries = $('Extract Rewritten').first().json?.rewritten;\nconst queriesArr = Array.isArray(queries)\n  ? queries.filter(s => typeof s === 'string' && s.trim().length > 0)\n  : (typeof queries === 'string' && queries.trim() ? [queries] : []);\n\nconst embRaw = $input.first().json || {};\nconst embData = Array.isArray(embRaw.data) ? embRaw.data : [];\n\nconst cfg = $('RAG Config').first().json || {};\nconst matchCount = Number(cfg.topK) || 8;\n\nconst items = [];\nfor (let i = 0; i < Math.min(queriesArr.length, embData.length); i++) {\n  const e = embData[i] && embData[i].embedding;\n  if (Array.isArray(e) && e.length > 0) {\n    items.push({\n      json: {\n        variantIndex: i,\n        query: queriesArr[i],\n        embedding: e,\n        matchCount\n      }\n    });\n  }\n}\n\n// If nothing valid, emit a placeholder so the chain still flows. The HTTP\n// node will likely 4xx (empty embedding) and Fuse Retrievals handles that.\nif (items.length === 0) {\n  items.push({\n    json: {\n      variantIndex: 0,\n      query: $('Extract Speech Fields').first().json?.transcript || 'general inquiry',\n      embedding: [],\n      matchCount,\n      placeholder: true\n    }\n  });\n}\n\nreturn items;"
+      },
+      "id": "cc0df99e-7fe2-4de9-89dd-d74a39c6b491",
+      "name": "Prepare Variant Pairs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        61664,
+        49648
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('RAG Config').first().json.supabaseUrl }}/rest/v1/rpc/hybrid_match_marblebee",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $('RAG Config').first().json.serviceRoleKey }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('RAG Config').first().json.serviceRoleKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"query_text\": {{ JSON.stringify($json.query) }},\n  \"query_embedding\": {{ JSON.stringify($json.embedding) }},\n  \"match_count\": {{ $json.matchCount }}\n}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 10,
+              "batchInterval": 0
+            }
+          },
+          "timeout": 4000
+        }
+      },
+      "id": "1e030c9e-16a8-4a2c-b6da-f51f0b7289d0",
+      "name": "Hybrid Search RPC",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        61920,
+        49648
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Reciprocal Rank Fusion across N variant retrievals, with a follow-up boost\n// AND a pinned-source fallback.\n//\n// (a) RRF: n8n's HTTP node v4.2 splits an array response into one item per\n// element, and the resulting `pairedItem` carries a unique global index\n// (0..N*matchCount-1) instead of pointing back to the originating variant.\n// Trusting it collapses every row into its own variant bucket, all at rank 1\n// — degenerating the RRF into \"count of variants the row appears in × const\".\n// Instead, we trust item ORDER (which n8n preserves) and group by\n// floor(idx / matchCount).\n//\n// (b) Anchored follow-up boost (token-overlap, full-history): when ANY URL\n// previously cited in the conversation has a slug sharing >=2 tokens with the\n// rewriter variants — at least one of which is non-domain (i.e., not\n// \"marble\"/\"tub\"/etc) — multiply fused_score by ANCHOR_BOOST for chunks whose\n// source_url matches that URL. We scan the FULL conversation history (via\n// Format History's allPriorSources), so a topic-back-switch (caller diverted\n// to Calacatta then returned to the original Designer Bathtub) still anchors\n// to the original product. The older substring-match was both too strict\n// (long marketing slugs almost never appear verbatim in a rewriter variant)\n// and too narrow (only looked at the most recent turn's sources).\n//\n// (c) Pinned-source fallback: for each URL whose slug matched the anchor\n// detector in (b), fetch its chunks directly via PostgREST and inject them\n// into the fused pool with a high score. Guarantees the matched product is a\n// top candidate even if the rewriter+RRF didn't surface it.\nconst RRF_K = 60;\nconst ANCHOR_BOOST = 2.0;\nconst matchCount = Number($('RAG Config').first().json?.topK) || 8;\nconst allItems = $input.all();\n\nconst byVariant = new Map();\nallItems.forEach((item, idx) => {\n  const j = item?.json;\n  if (!j) return;\n  const vi = Math.floor(idx / matchCount);\n  let rows = [];\n  if (Array.isArray(j)) rows = j;\n  else if (Array.isArray(j.body)) rows = j.body;\n  else if (Array.isArray(j.data)) rows = j.data;\n  else if (j.id !== undefined && j.content !== undefined) rows = [j];\n  if (rows.length === 0) return;\n  if (!byVariant.has(vi)) byVariant.set(vi, []);\n  byVariant.get(vi).push(...rows);\n});\n\nconst fused = new Map();\nconst callDiagnostics = [];\nfor (const [vi, rows] of byVariant) {\n  callDiagnostics.push({ vi, ok: true, rowCount: rows.length });\n  rows.forEach((row, idx) => {\n    const rank = idx + 1;\n    const score = 1.0 / (RRF_K + rank);\n    const existing = fused.get(row.id);\n    if (existing) {\n      existing.fused_score += score;\n      existing.variant_hits.push(vi);\n      if (typeof row.semantic_rank === 'number' &&\n          (existing.best_semantic_rank == null || row.semantic_rank < existing.best_semantic_rank)) {\n        existing.best_semantic_rank = row.semantic_rank;\n      }\n      if (typeof row.fts_rank === 'number' &&\n          (existing.best_fts_rank == null || row.fts_rank < existing.best_fts_rank)) {\n        existing.best_fts_rank = row.fts_rank;\n      }\n    } else {\n      fused.set(row.id, {\n        ...row,\n        fused_score: score,\n        variant_hits: [vi],\n        best_semantic_rank: typeof row.semantic_rank === 'number' ? row.semantic_rank : null,\n        best_fts_rank: typeof row.fts_rank === 'number' ? row.fts_rank : null\n      });\n    }\n  });\n}\n\nlet priorSources = [];\nlet allPriorSources = [];\nlet rewritten = [];\ntry {\n  const fh = $('Format History').first().json || {};\n  priorSources = fh.priorSources || [];\n  // Fall back to priorSources if Format History hasn't been updated yet.\n  allPriorSources = (Array.isArray(fh.allPriorSources) && fh.allPriorSources.length)\n    ? fh.allPriorSources\n    : priorSources;\n} catch (e) {}\ntry { rewritten = $('Extract Rewritten').first().json.rewritten || []; } catch (e) {}\n\nfunction slugFromUrl(u) {\n  if (typeof u !== 'string') return '';\n  const m = u.match(/\\/(?:products|collections)\\/([^\\/?#]+)/i);\n  if (!m) return '';\n  return m[1].replace(/-/g, ' ').toLowerCase();\n}\n\nconst STOP = new Set([\n  'the','a','an','of','for','to','in','on','at','by','with','and','or','from',\n  'is','are','was','were','be','have','has','had','do','does','it','this','that',\n  'sale','new','about','how','what','which','when','where','who','why'\n]);\n// Domain stopwords: tokens that appear in nearly every catalog slug, so\n// overlap on these alone is not signal that the user is anchoring on the\n// prior product. At least one non-domain overlap token is required.\nconst DOMAIN = new Set(['marble','tub','bathtub','stone','product','collection']);\nfunction tokensOf(s) {\n  return String(s || '').toLowerCase()\n    .replace(/[^a-z0-9 ]+/g, ' ')\n    .split(/\\s+/)\n    .filter(t => t.length > 2 && !STOP.has(t));\n}\n\nconst variantTokens = new Set();\nfor (const v of rewritten) for (const t of tokensOf(v)) variantTokens.add(t);\n\nconst ANCHOR_TOKEN_THRESHOLD = 2;\n// Of all prior URLs across the whole conversation, keep only those whose slug\n// has token-overlap with the current rewriter variants. In a topic switch the\n// list is empty (no overlap); in a topic-back-switch only the URL the caller\n// is naming again survives.\nconst matchedAnchors = [];\nfor (const url of allPriorSources) {\n  const slug = slugFromUrl(url);\n  if (!slug) continue;\n  const overlap = tokensOf(slug).filter(t => variantTokens.has(t));\n  if (overlap.length < ANCHOR_TOKEN_THRESHOLD) continue;\n  if (!overlap.some(t => !DOMAIN.has(t))) continue;\n  matchedAnchors.push(url);\n}\nconst anchoredToPrior = matchedAnchors.length > 0;\nconst matchedUrlSet = new Set(matchedAnchors);\n\nlet boostedCount = 0;\nif (anchoredToPrior) {\n  for (const row of fused.values()) {\n    const url = row.metadata && row.metadata.source_url;\n    if (url && matchedUrlSet.has(url)) {\n      row.fused_score *= ANCHOR_BOOST;\n      row.anchor_boosted = true;\n      boostedCount++;\n    }\n  }\n}\n\n// Pinned-source fallback: fetch chunks for the matched URLs directly so\n// they're guaranteed top candidates, in case the rewriter+RRF didn't surface\n// them.\nlet pinnedAdded = 0;\nlet pinError = null;\n// Skip pin fetch if every matchedAnchor URL is already represented in the fused\n// pool's top-N candidates — saves a 200-500ms PostgREST GET on the response path.\nconst PIN_TOPN_CHECK = matchCount * 2;\nlet needPinFetch = anchoredToPrior && matchedAnchors.length > 0;\nif (needPinFetch) {\n  const topRows = Array.from(fused.values())\n    .sort((a, b) => b.fused_score - a.fused_score)\n    .slice(0, PIN_TOPN_CHECK);\n  const presentUrls = new Set();\n  for (const r of topRows) {\n    const u = r && r.metadata && r.metadata.source_url;\n    if (u) presentUrls.add(u);\n  }\n  if (matchedAnchors.every(u => presentUrls.has(u))) {\n    needPinFetch = false;\n  }\n}\nif (needPinFetch) {\n  let helpers = null;\n  try { if (this && this.helpers) helpers = this.helpers; } catch (e) {}\n  const cfg2 = $('RAG Config').first().json || {};\n  const baseUrl = cfg2.supabaseUrl;\n  const apiKey = cfg2.serviceRoleKey;\n  if (helpers && typeof helpers.httpRequest === 'function' && baseUrl && apiKey) {\n    const inList = matchedAnchors.map(u => '\"' + u + '\"').join(',');\n    const valuePart = 'in.(' + inList + ')';\n    const url = baseUrl + '/rest/v1/marblebee_documents'\n      + '?select=id,content,metadata,source_url,chunk_index'\n      + '&source_url=' + encodeURIComponent(valuePart)\n      + '&order=chunk_index.asc'\n      + '&limit=' + (matchedAnchors.length * 3);\n    try {\n      const rows = await helpers.httpRequest({\n        method: 'GET',\n        url: url,\n        headers: {\n          apikey: apiKey,\n          Authorization: 'Bearer ' + apiKey,\n          Accept: 'application/json'\n        },\n        json: true,\n        returnFullResponse: false,\n        timeout: 3000,\n      });\n      if (Array.isArray(rows)) {\n        let maxExisting = 0;\n        for (const r of fused.values()) if (r.fused_score > maxExisting) maxExisting = r.fused_score;\n        const PIN_BASE = (maxExisting || 0.05) * 1.5;\n        rows.forEach((row, idx) => {\n          if (fused.has(row.id)) {\n            const existing = fused.get(row.id);\n            existing.fused_score = Math.max(existing.fused_score, PIN_BASE - idx * 0.0001);\n            existing.pinned = true;\n          } else {\n            fused.set(row.id, {\n              ...row,\n              fused_score: PIN_BASE - idx * 0.0001,\n              variant_hits: [],\n              best_semantic_rank: null,\n              best_fts_rank: null,\n              pinned: true\n            });\n          }\n          pinnedAdded++;\n        });\n      }\n    } catch (e) {\n      pinError = String(e && e.message || e);\n    }\n  }\n}\n\nconst variantsUsed = byVariant.size;\nconst merged = Array.from(fused.values())\n  .sort((a, b) => b.fused_score - a.fused_score)\n  .slice(0, matchCount * Math.max(variantsUsed, 1));\n\nreturn [{\n  json: {\n    body: merged,\n    retrievedCount: merged.length,\n    variantsUsed,\n    inputItemsCount: allItems.length,\n    anchoredToPrior,\n    boostedCount,\n    pinnedAdded,\n    pinError,\n    matchedAnchors,\n    priorSources,\n    allPriorSources,\n    callDiagnostics\n  }\n}];"
+      },
+      "id": "7d098331-e90f-404e-ac2c-dfac8bd7cb9b",
+      "name": "Fuse Retrievals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        62176,
+        49648
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Diversify retrievals: keep at most N chunks per source_url so we don't\n// give the LLM five chunks all from one product page.\nconst MAX_PER_SOURCE = $('RAG Config').first().json.maxChunksPerSource || 2;\n\nconst raw = $input.first().json;\nlet rows = [];\nif (Array.isArray(raw)) rows = raw;\nelse if (Array.isArray(raw.body)) rows = raw.body;\nelse if (Array.isArray(raw.data)) rows = raw.data;\n// Supabase REST returns the array at top level when calling RPC\nelse if (raw && typeof raw === 'object' && raw.id !== undefined && raw.content !== undefined) rows = [raw];\nelse if (Array.isArray(raw?.json)) rows = raw.json;\n\nconst counts = new Map();\nconst kept = [];\nconst dropped = [];\n\nfor (const r of rows) {\n  const url = (r.metadata && r.metadata.source_url) || 'unknown';\n  const seen = counts.get(url) || 0;\n  if (seen < MAX_PER_SOURCE) {\n    kept.push(r);\n    counts.set(url, seen + 1);\n  } else {\n    dropped.push({ url, similarity: r.similarity });\n  }\n}\n\nreturn [{\n  json: {\n    chunks: kept,\n    droppedForDiversity: dropped,\n    retrievedCount: rows.length,\n    keptCount: kept.length,\n    distinctSources: counts.size\n  }\n}];"
+      },
+      "id": "56554019-cfd0-46b6-afdc-44589bd5e947",
+      "name": "Diversify Retrievals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        62432,
+        49648
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a numbered context block the LLM can cite. Each chunk gets a number\n// and the source URL is preserved. Individual chunks are capped so a single\n// fat chunk can't crowd everything else out, and the total is capped so the\n// prompt stays comfortably inside gpt-4o-mini's window.\nconst chunks = $json.chunks || [];\nconst MAX_CONTEXT_CHARS = 4500;\nconst MAX_PER_CHUNK_CHARS = 900;\n\nconst formatted = [];\nlet total = 0;\nlet sourceUrls = [];\n\nfor (let i = 0; i < chunks.length; i++) {\n  const c = chunks[i];\n  const url = (c.metadata && c.metadata.source_url) || 'unknown';\n  const title = (c.metadata && c.metadata.page_title) || '';\n  let content = (c.content || '').trim();\n  if (content.length > MAX_PER_CHUNK_CHARS) {\n    content = content.slice(0, MAX_PER_CHUNK_CHARS) + '…';\n  }\n  const block = `[${i + 1}] (${title || url}) ${url}\\n${content}`;\n  if (total + block.length > MAX_CONTEXT_CHARS && formatted.length > 0) break;\n  formatted.push(block);\n  if (!sourceUrls.includes(url)) sourceUrls.push(url);\n  total += block.length;\n}\n\nconst contextBlock = formatted.join('\\n\\n---\\n\\n');\nreturn [{\n  json: {\n    contextBlock: contextBlock || '(no relevant content found in the knowledge base)',\n    chunksUsed: formatted.length,\n    sourceUrls,\n    chunks  // keep for logging\n  }\n}];"
+      },
+      "id": "e59e7cc7-dc25-48a1-b679-b5236e59e515",
+      "name": "Build Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        62688,
+        49648
+      ]
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "responses": {
+          "values": [
+            {
+              "content": "=You are MarbleBee's after-hours AI voice assistant. Your job is to answer the caller's question using ONLY the retrieved knowledge below. You never invent facts and you never use prior training knowledge.\n\nThe caller is on a phone call. Their speech may be noisy, mispronounced, or partial. Treat retrieved chunks as the source of truth and match them generously against what the caller said.\n\nYou execute the following FOUR STEPS in order, every single turn. Do not skip any step. Do not escalate without working through all four.\n\n────────────────────────────────────────────────────────────\nSTEP 1 — IDENTIFY THE SUBJECT (what the caller is asking about)\n────────────────────────────────────────────────────────────\nPick exactly one: a product, material, or topic.\n\n(a) READ CALLER SAID. If it explicitly names something — even partially, with a typo, or phonetically — that's the subject.\n   - Phonetic / spelling tolerance: \\\"calcatta\\\", \\\"kalakata\\\", \\\"cala-cata\\\", \\\"Calacutta\\\" → all mean Calacatta. \\\"unique designer bathtub\\\" matches \\\"Marble Bathtub | Unique Designer Bathtub 70.87\\\" Long\\\". \\\"black galaxy\\\" matches \\\"Black Galaxy granite\\\". When in doubt, treat the caller's words as a fuzzy, partial reference to the closest chunk title.\n   - Partial names match full ones: \\\"Calacatta marble\\\" → \\\"Calacatta White Marble Sample\\\". \\\"triangle basin\\\" → \\\"Triangle stone basin\\\". \\\"the white pedestal\\\" → \\\"Calacatta white stone pedestal sink\\\".\n\n(b) IF CALLER SAID NAMES NOTHING (it's a fragment), look at PRIOR CONVERSATION top-to-bottom. The subject is the most recently named product/material/topic. A subject named in turn 1 is still the subject in turn 7 if nothing else has been named since.\n   - Fragment principle: any utterance whose subject would be unclear if read in isolation is a fragment. Common shapes (illustrative, not exhaustive): pronouns (\\\"it\\\", \\\"that\\\"), bare specs (\\\"price?\\\", \\\"weight?\\\", \\\"material?\\\", \\\"dimensions?\\\"), multi-attribute combos (\\\"weight and dimensions?\\\", \\\"price and shipping?\\\"), comparisons (\\\"which is heavier?\\\", \\\"any cheaper ones?\\\"), yes/no fragments (\\\"is it in stock?\\\", \\\"any warranty?\\\"), and any other context-dependent question.\n\n(c) Reference-back: if CALLER SAID points back to an earlier subject by description (\\\"the Triangle one\\\", \\\"the first basin\\\", \\\"the white one we talked about\\\"), the subject is that earlier product, NOT the most recent one. Use prior conversation to identify which.\n\n(d) The output of STEP 1 is a single subject string, e.g. \\\"Calacatta marble\\\" or \\\"Triangle stone basin\\\".\n\n────────────────────────────────────────────────────────────\nSTEP 2 — FIND THE SUBJECT IN RETRIEVED KNOWLEDGE\n────────────────────────────────────────────────────────────\nScan every chunk in RETRIEVED KNOWLEDGE for the subject. Match generously:\n   - Title or content mentions match. Spelling/phonetic variants match. Partial names match full names. Material/category words match products of that material/category.\n   - The retrieval system has already filtered to relevant chunks. If a chunk is here, treat it as a candidate, not a coincidence.\n\nRecord:\n   - PRIMARY: chunks that match the subject directly (exact or fuzzy).\n   - RELATED: chunks in the same category/material as the subject, even if not the exact product.\n   - If the subject was carried over from PRIOR CONVERSATION, it's almost certainly answerable — the retrieval was anchored to it.\n\n────────────────────────────────────────────────────────────\nSTEP 3 — DECIDE THE INTENT\n────────────────────────────────────────────────────────────\nApply the FIRST rule that fits, in order:\n\nRULE 1 — EXACT MATCH (intent=\\\"answered\\\", confidence ≥ 0.9)\n   PRIMARY chunks contain the answer to the caller's question (resolved through STEP 1).\n   Use this whenever you have the answer in front of you, even if it took fuzzy matching to find. Speak the answer directly.\n\nRULE 2 — PARTIAL MATCH (intent=\\\"answered\\\", confidence 0.85–0.9)\n   The caller asked for a specific product/spec the chunks don't have, but RELATED chunks contain similar/alternative products.\n   Acknowledge the exact request wasn't found, list the closest matches (names + prices), offer team follow-up.\n\nRULE 2b — ATTRIBUTE NOT LISTED (intent=\\\"answered\\\", confidence 0.85–0.9)\n   PRIMARY chunks ARE about the right product, but the specific attribute the caller asked about (e.g. radius, drain location, color options) is not in those chunks.\n   Confirm the product. State the attributes you DO have. If the asked attribute is geometrically/logically incompatible with the product (e.g. \\\"radius\\\" of a rectangular tub), say so plainly. Otherwise say the spec isn't listed and offer follow-up.\n\nRULE 3 — ESCALATE (intent=\\\"escalate\\\", confidence ≤ 0.3)\n   Use ONLY when ALL of the following hold:\n     - STEP 1 produced no subject (no product/topic named in CALLER SAID, no product named in any prior turn).\n     - STEP 2 found nothing in PRIMARY or RELATED.\n   If STEP 1 produced a subject AND that subject (or anything fuzzily resembling it) appears in any chunk, you MUST NOT escalate — answer with rule 1 or 2b.\n\nANTI-PATTERNS — do not do these:\n   - \\\"The chunks don't contain the exact phrase the caller said\\\" → that's not a reason to escalate. Match fuzzily (STEP 2).\n   - \\\"The caller's question is short / lacks a product name\\\" → that's not a reason to escalate. Resolve via PRIOR CONVERSATION (STEP 1b).\n   - \\\"I'm not 100% sure which Calacatta product they meant\\\" → if multiple Calacatta chunks exist, list them as a partial match (rule 2). Don't escalate.\n   - **CARRYING OVER FACTS FROM PRIOR CONVERSATION** → NEVER reuse a price, dimension, weight, material, or any specific fact from PRIOR CONVERSATION even if the same product was discussed earlier. ALL specific facts MUST come from the RETRIEVED KNOWLEDGE chunks for the CURRENT turn. PRIOR CONVERSATION is ONLY for resolving pronouns and identifying the active subject — it is NEVER a source of facts.\n\n────────────────────────────────────────────────────────────\nSTEP 4 — RESPOND IN JSON ONLY (no markdown, no prose)\n────────────────────────────────────────────────────────────\nSchema:\n{\n  \\\"intent\\\": \\\"answered\\\" | \\\"escalate\\\",\n  \\\"confidence\\\": <number 0.0-1.0>,\n  \\\"spoken_response\\\": <string under 50 words, TTS-ready, no markdown>,\n  \\\"summary\\\": <string, one sentence>,\n  \\\"caller_question\\\": <string, paraphrased — use the RESOLVED question from STEP 1, not the literal fragment>,\n  \\\"category\\\": \\\"order\\\" | \\\"pricing\\\" | \\\"product_info\\\" | \\\"delivery\\\" | \\\"hours\\\" | \\\"complaint\\\" | \\\"general\\\" | \\\"other\\\",\n  \\\"sources\\\": [<array of source URLs whose chunks you actually used>],\n  \\\"reasoning\\\": <string, one sentence — name the subject and which chunk you used>\n}\n\nFORMAT:\n   - Every string double-quoted on both sides. Escape internal quotes as \\\\\\\".\n   - No trailing commas. No comments. No single quotes. No markdown fences.\n\nTTS NUMBERS:\n   - Prices in words: \\\"six hundred eighty-nine dollars\\\", not \\\"$689\\\".\n   - Dimensions stay as numbers: \\\"70.87 inches\\\".\n\nGENERAL:\n   - sources lists ONLY URLs whose chunks you actually used in the answer.\n   - Never invent prices, products, dimensions, dates, contacts.\n   - spoken_response under 50 words.\n\n────────────────────────────────────────────────────────────\nWORKED EXAMPLES (study these — they show the principles in action)\n────────────────────────────────────────────────────────────\n\nEXAMPLE A — single-turn fragment, prior anchor (rule 1, fuzzy match):\n   PRIOR: \\\"User: What is the weight of Triangle stone basin?\\\"\n   CALLER SAID: \\\"What is the price?\\\"\n   STEP 1: fragment, ACTIVE SUBJECT from prior = Triangle stone basin.\n   STEP 2: chunk shows \\\"# Triangle stone basin / Price: $689.00\\\".\n   STEP 3: rule 1, confidence 0.95.\n   spoken: \\\"The Triangle Stone Basin is six hundred eighty-nine dollars.\\\"\n\nEXAMPLE C — caller mid-typed product name (rule 2, partial match — DO NOT escalate):\n   CALLER SAID: \\\"Do you have calcatta marble?\\\"  (caller dropped a letter)\n   STEP 1: explicitly names a product → subject = Calacatta marble (fuzzy match handles \\\"calcatta\\\" → \\\"Calacatta\\\").\n   STEP 2: chunks show \\\"Calacatta White Marble Sample\\\" ($100), \\\"Calacatta white stone pedestal sink\\\" ($4,385), \\\"Calacutta White Marble Handbag\\\" ($2,450).\n   STEP 3: multiple Calacatta products in stock → rule 2 partial match, confidence 0.88. Acknowledge variants, list with prices.\n   spoken: \\\"Yes, we have several Calacatta marble products: a Calacatta White marble sample tile at one hundred dollars, a Calacatta white stone pedestal sink at four thousand three hundred eighty-five dollars, and a Calacutta white marble handbag at two thousand four hundred fifty dollars. Want me to have someone follow up?\\\"\n\nEXAMPLE E — clean topic switch (drop ALL prior facts, use new chunks only):\n   PRIOR: \\\"User: Triangle stone basin? / Asst: Yes, six hundred eighty-nine dollars. / User: weight? / Asst: Eight kilograms.\\\"\n   CALLER SAID: \\\"Do you have a long unique designer bathtub at around seventy point eight seven?\\\"\n   STEP 1: explicit new product → subject = unique designer bathtub 70.87\\\". DROP Triangle stone basin entirely. NEVER carry over its $689 price.\n   STEP 2: chunks show \\\"Marble Bathtub | Unique Designer Bathtub 70.87\\\" Long\\\" priced at $18,210. That's the answer.\n   STEP 3: rule 1, confidence 0.92.\n   spoken: \\\"Yes, the Unique Designer Bathtub is seventy point eight seven inches long and is eighteen thousand two hundred ten dollars.\\\"\n\nEXAMPLE F — true escalation (no subject anywhere, nothing in chunks):\n   PRIOR: empty.\n   CALLER SAID: \\\"What's your return policy?\\\"\n   STEP 1: subject = return policy.\n   STEP 2: no chunks about returns.\n   STEP 3: rule 3, confidence 0.2.\n   spoken: \\\"I don't have details on return policy in front of me. A team member will follow up.\\\"\n\n────────────────────────────────────────────────────────────\nEXECUTE NOW for the inputs below.\n────────────────────────────────────────────────────────────\n\n=== RETRIEVED KNOWLEDGE (numbered, each block from MarbleBee's website) ===\n{{ $json.contextBlock || '' }}\n=== END RETRIEVED KNOWLEDGE ===\n\nPRIOR CONVERSATION (oldest to newest, may be empty for first turn):\n{{ $('Format History').first().json.historyText || '(no prior turns)' }}\n\nCALLER SAID: {{ $('Extract Speech Fields').first().json.transcript || 'No speech detected' }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "id": "ecdd5592-a4eb-43f4-80a9-8fe8b93e96aa",
+      "name": "Generate Answer (RAG)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [
+        62944,
+        49648
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "vqyuT7cErwUg10ar",
+          "name": "OpenAI account"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the OpenAI JSON response, enforce confidence floor, attach context.\n// Tolerant of:\n//   1) Every shape the OpenAI / langchain nodes have emitted (Responses API,\n//      chat-completions, simplified, already-parsed)\n//   2) Common LLM JSON-format errors — specifically the case where string values\n//      are missing the opening double quote: \"key\": value with spaces\",\nconst out = $input.first().json;\n\nfunction getText(j) {\n  if (!j) return null;\n  if (typeof j.output_text === 'string') return j.output_text;\n  if (typeof j.text === 'string') return j.text;\n  if (typeof j.content === 'string') return j.content;\n  if (typeof j.message?.content === 'string') return j.message.content;\n  if (Array.isArray(j.output)) {\n    for (const item of j.output) {\n      if (Array.isArray(item?.content)) {\n        for (const c of item.content) {\n          if (typeof c?.text === 'string') return c.text;\n        }\n      }\n    }\n  }\n  if (typeof j.choices?.[0]?.message?.content === 'string') return j.choices[0].message.content;\n  return null;\n}\n\nfunction stripFences(s) {\n  return s.trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '').trim();\n}\n\n// Repair LLM JSON: add missing opening quotes on string values.\n// Pattern: \"key\":<space><non-quote-char><...rest of line...>\",\n//          → \"key\":<space>\"<...>\"\nfunction repairUnquotedStrings(s) {\n  return s.replace(\n    /(\"[A-Za-z_][\\w]*\"\\s*:\\s*)([^\"\\[\\{\\d\\-tfn\\s][^\\n]*?)(\"\\s*[,\\n}])/g,\n    (m, key, value, end) => key + '\"' + value + end\n  ).replace(\n    // Same pattern but trailing close-brace without preceding quote (last field)\n    /(\"[A-Za-z_][\\w]*\"\\s*:\\s*)([^\"\\[\\{\\d\\-tfn\\s][^\\n]*?)(\\n\\s*})/g,\n    (m, key, value, end) => key + '\"' + value.replace(/\\s*$/, '') + '\"' + end\n  );\n}\n\nfunction tryParseLenient(s) {\n  if (typeof s !== 'string') return null;\n  const cleaned = stripFences(s);\n  try { return JSON.parse(cleaned); } catch {}\n  try { return JSON.parse(repairUnquotedStrings(cleaned)); } catch {}\n  return null;\n}\n\n// Last-resort regex extraction. Pulls each field individually.\nfunction regexExtract(s) {\n  if (typeof s !== 'string') return null;\n  const grabStr = (key) => {\n    // Match key: optional-quote value optional-quote (lookahead next field or close)\n    const re = new RegExp(\n      '\"' + key + '\"\\\\s*:\\\\s*\"?([\\\\s\\\\S]+?)\"?\\\\s*(?=,\\\\s*\\\\n\\\\s*\"\\\\w+\"|\\\\n?\\\\s*})',\n      'i'\n    );\n    const m = s.match(re);\n    return m ? m[1].trim().replace(/\\s*\"\\s*$/, '') : undefined;\n  };\n  const intentM = s.match(/\"intent\"\\s*:\\s*\"?(answered|escalate)\"?/i);\n  if (!intentM) return null;\n  const confM = s.match(/\"confidence\"\\s*:\\s*([\\d.]+)/);\n  const sourcesM = s.match(/\"sources\"\\s*:\\s*\\[([\\s\\S]*?)\\]/);\n  const sources = sourcesM\n    ? Array.from(sourcesM[1].matchAll(/\"([^\"]+)\"/g)).map(m => m[1])\n    : [];\n  return {\n    intent: intentM[1].toLowerCase(),\n    confidence: confM ? parseFloat(confM[1]) : 0,\n    spoken_response: grabStr('spoken_response'),\n    summary: grabStr('summary'),\n    caller_question: grabStr('caller_question'),\n    category: (grabStr('category') || 'other').toLowerCase(),\n    sources,\n    reasoning: grabStr('reasoning')\n  };\n}\n\nlet parsed = null;\nlet parseStrategy = 'none';\n\n// Strategy A: top-level already an object with intent\nif (out && typeof out.intent === 'string') {\n  parsed = out;\n  parseStrategy = 'top-level-object';\n}\n// Strategy B: message.content already an object\nif (!parsed) {\n  const m = out?.message?.content;\n  if (m && typeof m === 'object' && typeof m.intent === 'string') {\n    parsed = m;\n    parseStrategy = 'message-object';\n  }\n}\n// Strategy C: extract text and try to parse (with repair)\nlet rawText = null;\nif (!parsed) {\n  rawText = getText(out);\n  parsed = tryParseLenient(rawText);\n  if (parsed) parseStrategy = 'lenient-parse';\n}\n// Strategy D: regex extraction as last resort\nif (!parsed && rawText) {\n  parsed = regexExtract(rawText);\n  if (parsed) parseStrategy = 'regex-extract';\n}\n\nif (!parsed || typeof parsed.intent !== 'string') {\n  parsed = {\n    intent: 'escalate',\n    confidence: 0,\n    spoken_response: 'I am having trouble looking that up right now. Let me have a team member call you back with the exact details.',\n    summary: 'Failed to parse RAG response',\n    caller_question: '',\n    category: 'other',\n    sources: [],\n    reasoning: 'parse failure'\n  };\n  parseStrategy = 'fallback';\n}\n\n// Enforce 0.9 confidence floor regardless of model self-assessment.\nconst threshold = $('RAG Config').first().json.confidenceThreshold || 0.9;\nconst aiConfidence = typeof parsed.confidence === 'number' ? parsed.confidence : 0;\nlet enforcedIntent = parsed.intent;\nif (parsed.intent === 'answered' && aiConfidence < threshold) {\n  enforcedIntent = 'escalate';\n  parsed.spoken_response = 'I want to make sure you get the most accurate information. Let me have a team member follow up with you on this number shortly.';\n}\n\nconst caller = $('Extract Speech Fields').first().json;\nconst ctx = $('Build Context').first().json;\nconst startedAt = caller.startedAt;\nconst responseMs = startedAt ? Date.now() - new Date(startedAt).getTime() : null;\n\nreturn [{\n  json: {\n    intent: enforcedIntent,\n    aiOriginalIntent: parsed.intent,\n    aiConfidence,\n    confidenceThreshold: threshold,\n    parseStrategy,\n    spokenResponse: parsed.spoken_response,\n    summary: parsed.summary,\n    callerQuestion: parsed.caller_question || caller.transcript,\n    category: parsed.category,\n    sources: parsed.sources || [],\n    reasoning: parsed.reasoning,\n    callSid: caller.callSid,\n    fromNumber: caller.fromNumber,\n    transcript: caller.transcript,\n    speechConfidence: caller.speechConfidence,\n    chunksUsed: ctx?.chunksUsed || 0,\n    retrievedChunks: ctx?.chunks || [],\n    retrievedSourceUrls: ctx?.sourceUrls || [],\n    responseMs\n  }\n}];"
+      },
+      "id": "64ca1482-d2ee-412c-a404-a909a9c7b758",
+      "name": "Parse RAG Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        63200,
+        49648
+      ]
+    },
+    {
+      "parameters": {
+        "tableId": "marblebee_query_log",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "call_sid",
+              "fieldValue": "={{ $('Finalized Answer').first().json.callSid || '' }}"
+            },
+            {
+              "fieldId": "caller_number",
+              "fieldValue": "={{ $('Finalized Answer').first().json.fromNumber || '' }}"
+            },
+            {
+              "fieldId": "raw_transcript",
+              "fieldValue": "={{ $('Finalized Answer').first().json.transcript || '' }}"
+            },
+            {
+              "fieldId": "rewritten_query",
+              "fieldValue": "={{ $('Extract Rewritten').isExecuted ? ($('Extract Rewritten').first().json.rewritten || '') : [] }}"
+            },
+            {
+              "fieldId": "retrieved_ids",
+              "fieldValue": "={{ (($('Finalized Answer').first().json.retrievedChunks) || []).map(c => c.id).filter(Boolean) }}"
+            },
+            {
+              "fieldId": "retrieval_scores",
+              "fieldValue": "={{ (($('Finalized Answer').first().json.retrievedChunks) || []).map(c => c.similarity).filter(s => s !== undefined) }}"
+            },
+            {
+              "fieldId": "retrieved_urls",
+              "fieldValue": "={{ $('Finalized Answer').first().json.retrievedSourceUrls || [] }}"
+            },
+            {
+              "fieldId": "ai_intent",
+              "fieldValue": "={{ $('Finalized Answer').first().json.intent || '' }}"
+            },
+            {
+              "fieldId": "ai_confidence",
+              "fieldValue": "={{ $('Finalized Answer').first().json.aiConfidence || 0 }}"
+            },
+            {
+              "fieldId": "ai_response",
+              "fieldValue": "={{ $('Finalized Answer').first().json.spokenResponse || '' }}"
+            },
+            {
+              "fieldId": "response_ms",
+              "fieldValue": "={{ $('Finalized Answer').first().json.responseMs || 0 }}"
+            },
+            {
+              "fieldId": "escalated",
+              "fieldValue": "={{ $('Finalized Answer').first().json.intent === 'escalate' }}"
+            }
+          ]
+        }
+      },
+      "id": "cf1c3170-01b0-4c04-867f-1a6b8829be31",
+      "name": "Log Query → Supabase",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        63968,
+        49808
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "j2ERN030AwiGDkVu",
+          "name": "Supabase account"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "intent-answered",
+              "leftValue": "={{ $('Finalized Answer').first().json.intent }}",
+              "rightValue": "answered",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1e2de4dc-8f2b-4099-9acf-2b2fc31665ac",
+      "name": "Can AI Answer?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        63968,
+        49488
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "16RqfNVn-f7w4oooVVZmbAqO15xMypP66UBVCLsvEnaA",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Tickets",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "CallSid": "={{ $('Finalized Answer').first().json.callSid }}",
+            "From": "={{ $('Finalized Answer').first().json.fromNumber }}",
+            "Category": "={{ $('Finalized Answer').first().json.category }}",
+            "Question": "={{ $('Finalized Answer').first().json.callerQuestion }}",
+            "Summary": "={{ $('Finalized Answer').first().json.summary }}",
+            "Status": "open",
+            "Timestamp": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "CallSid",
+              "displayName": "CallSid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "From",
+              "displayName": "From",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Category",
+              "displayName": "Category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Question",
+              "displayName": "Question",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Summary",
+              "displayName": "Summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Timestamp",
+              "displayName": "Timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "3153df16-045f-455d-975d-aeb057a0524b",
+      "name": "Log Ticket → Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        64224,
+        49328
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "jkaw20ROwh4Gt038",
+          "name": "bilalhaider.tech"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $env.NOTIFICATION_EMAIL }}",
+        "subject": "=New after-hours call ticket — {{ $('Finalized Answer').first().json.category }} — from {{ $('Finalized Answer').first().json.fromNumber }}",
+        "message": "=<div style=\"font-family:Arial,sans-serif;max-width:640px\">\n  <h2 style=\"color:#1a73e8;margin-bottom:8px\">New after-hours call — ticket opened</h2>\n  <p style=\"color:#555;margin-top:0\">An AI assistant handled an incoming call and could not fully resolve the request. Please follow up.</p>\n  <table style=\"border-collapse:collapse;width:100%;margin-top:16px\">\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7;width:160px\"><strong>From</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ $('Finalized Answer').first().json.fromNumber }}</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>Category</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ $('Finalized Answer').first().json.category }}</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>Question</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ $('Finalized Answer').first().json.callerQuestion }}</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>AI summary</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ $('Finalized Answer').first().json.summary }}</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>AI confidence</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ ($('Finalized Answer').first().json.aiConfidence * 100).toFixed(0) }}% (threshold {{ ($('Finalized Answer').first().json.confidenceThreshold * 100).toFixed(0) }}%)</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>Sources consulted</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ ($('Finalized Answer').first().json.retrievedSourceUrls || []).map(u => '<a href=\"'+u+'\">'+u+'</a>').join('<br>') || '(none)' }}</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>AI reasoning</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ $('Finalized Answer').first().json.reasoning }}</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>Response time</strong></td><td style=\"padding:8px;border:1px solid #eee\">{{ $('Finalized Answer').first().json.responseMs }} ms</td></tr>\n    <tr><td style=\"padding:8px;border:1px solid #eee;background:#f7f7f7\"><strong>CallSid</strong></td><td style=\"padding:8px;border:1px solid #eee\"><code>{{ $('Finalized Answer').first().json.callSid }}</code></td></tr>\n  </table>\n  <p style=\"color:#888;font-size:12px;margin-top:24px\">Sent automatically by the MarbleBee n8n RAG pipeline.</p>\n</div>",
+        "options": {}
+      },
+      "id": "c7285c94-b194-4fb7-8433-1689ef940ee3",
+      "name": "Email: Notify Team",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        64224,
+        49488
+      ],
+      "webhookId": "b91d203b-b33a-443b-b828-f4ecdba2e5c5",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "bVrec9uRnIq8KkGZ",
+          "name": "bilalhaider.tech"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "### 4. Call Status Callback (session cleanup on hangup)\nTwilio POSTs here when the call terminates. We explicitly DELETE the Redis chat-history key for that CallSid so memory is cleared the moment the call ends — no waiting on the 30-minute TTL safety net.\n\nTo enable: Twilio Console → your number → Voice Configuration → \"Call status changes\" → POST to `https://<your-n8n>/webhook/call-status`. Subscribe to: completed, busy, no-answer, failed, canceled.\n\nNote: assign your Redis credential to the \"Delete Redis Session\" node after import (same credential used by the Redis Chat Memory nodes).",
+        "height": 200,
+        "width": 1700,
+        "color": 5
+      },
+      "id": "f76bec18-b0c2-490a-8a32-021139a29f34",
+      "name": "Section 4 Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        56736,
+        48992
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "call-status",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "id": "ad0131ad-a030-4dac-bc56-b1d285e664ac",
+      "name": "Twilio: Call Status",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        56800,
+        49152
+      ],
+      "webhookId": "marblebee-rag-call-status"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Twilio call-status callback. Extract CallSid + status, then forward to the\n// Redis delete node which removes the chat-history key for this session so\n// memory is cleared the instant the call ends (TTL stays as a safety net).\nconst body = $input.first().json.body || $input.first().json;\nconst callSid = body.CallSid || body.callSid || null;\nconst callStatus = (body.CallStatus || body.callStatus || '').toLowerCase();\nconst terminalStatuses = ['completed', 'busy', 'no-answer', 'failed', 'canceled'];\nreturn [{\n  json: {\n    callSid,\n    callStatus,\n    isTerminal: terminalStatuses.includes(callStatus),\n    sessionKey: callSid,\n    receivedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "aac09a6a-1c99-48fe-a01b-3fefdcb46920",
+      "name": "Clear Session",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        57056,
+        49152
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "key": "={{ $json.callSid }}"
+      },
+      "id": "556ddf7f-93e1-48d4-b3ce-321ce4ecc531",
+      "name": "Delete Redis Session",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        57312,
+        49152
+      ],
+      "credentials": {
+        "redis": {
+          "id": "TOXcBwp2Y2qCuFUh",
+          "name": "Redis account"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "ok",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "d52f2437-6e4f-451f-98db-d89808d2d18b",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        58080,
+        49152
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "68da842b-7c78-4fa8-b53c-914c60d5b257",
+      "name": "Get Memory Messages",
+      "type": "@n8n/n8n-nodes-langchain.memoryManager",
+      "typeVersion": 1.1,
+      "position": [
+        58848,
+        49488
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate the Memory Manager's output into a single item that matches the\n// shape the downstream prompts expect. Also parses the [sources: ...] suffix\n// we append to AI messages, so the rewriter can anchor follow-ups to the\n// canonical product/collection URLs cited in the previous assistant turn.\nconst items = $input.all();\nconst messages = [];\n\nfunction parseSources(text) {\n  if (typeof text !== 'string') return { text: text, urls: [] };\n  const m = text.match(/\\n?\\[sources:\\s*([^\\]]*)\\]\\s*$/i);\n  if (!m) return { text: text, urls: [] };\n  const urls = m[1].split(',').map(s => s.trim()).filter(Boolean);\n  const stripped = text.slice(0, m.index).replace(/\\s+$/, '');\n  return { text: stripped, urls: urls };\n}\n\nfunction pushMsg(m) {\n  if (!m || typeof m !== 'object') return;\n  const hasPair = (typeof m.human === 'string' && m.human) || (typeof m.ai === 'string' && m.ai);\n  if (hasPair) {\n    if (typeof m.human === 'string' && m.human) messages.push({ type: 'human', content: m.human });\n    if (typeof m.ai === 'string' && m.ai) {\n      const r = parseSources(m.ai);\n      messages.push({ type: 'ai', content: r.text, sources: r.urls });\n    }\n    return;\n  }\n  const type = String(m.type || m.role || '').toLowerCase();\n  const rawContent = m.content || m.message || m.text || '';\n  if (!rawContent) return;\n  if (type === 'ai' || type === 'assistant') {\n    const r = parseSources(rawContent);\n    messages.push({ type: type, content: r.text, sources: r.urls });\n  } else {\n    messages.push({ type: type, content: rawContent });\n  }\n}\n\nif (items.length === 1) {\n  const j0 = items[0]?.json || {};\n  const arr = j0.messages || j0.chatMessages || j0.history;\n  if (Array.isArray(arr)) {\n    for (const m of arr) pushMsg(m);\n  } else if (j0.type || j0.role || j0.human || j0.ai) {\n    pushMsg(j0);\n  }\n}\nif (messages.length === 0) {\n  for (const it of items) pushMsg(it?.json);\n}\n\nconst lines = [];\nfor (const m of messages) {\n  const role = (m.type === 'human' || m.type === 'user') ? 'User' : 'Assistant';\n  lines.push(role + ': ' + m.content);\n}\nconst historyText = lines.join('\\n');\n\n// Most recent assistant turn's cited sources. These are the strongest\n// follow-up anchor for the rewriter — if the next caller turn is a fragment\n// (\"what's the price?\"), the rewriter is told to use these to expand it.\nlet priorSources = [];\nfor (let i = messages.length - 1; i >= 0; i--) {\n  const m = messages[i];\n  if ((m.type === 'ai' || m.type === 'assistant') && Array.isArray(m.sources) && m.sources.length) {\n    priorSources = m.sources;\n    break;\n  }\n}\nconst priorSourcesText = priorSources.length ? priorSources.join('\\n') : '';\n\n// Union of all sources cited across the entire conversation, deduplicated and\n// ordered most-recent-first. The rewriter still uses `priorSources` (only the\n// most recent turn) for follow-up expansion, but Fuse Retrievals uses this\n// wider set so a topic-back-switch — caller spent a turn on Calacatta, now\n// asks again about the original Designer Bathtub — can still anchor and pin\n// the original product. Token-overlap detection in Fuse Retrievals filters\n// out non-matching slugs, so widening this set is safe.\nconst allPriorSources = [];\nconst seenSrc = new Set();\nfor (let i = messages.length - 1; i >= 0; i--) {\n  const m = messages[i];\n  if ((m.type === 'ai' || m.type === 'assistant') && Array.isArray(m.sources)) {\n    for (const u of m.sources) {\n      if (u && !seenSrc.has(u)) { seenSrc.add(u); allPriorSources.push(u); }\n    }\n  }\n}\n\nconst speech = $('Extract Speech Fields').first().json || {};\nconst ragCfg = $('RAG Config').first().json || {};\n\nreturn [{\n  json: {\n    ...ragCfg,\n    callSid: speech.callSid,\n    transcript: speech.transcript,\n    fromNumber: speech.fromNumber,\n    speechConfidence: speech.speechConfidence,\n    startedAt: speech.startedAt,\n    conversationHistory: messages,\n    historyText: historyText,\n    historyTurnCount: messages.length,\n    priorSources: priorSources,\n    priorSourcesText: priorSourcesText,\n    allPriorSources: allPriorSources,\n    sessionSource: messages.length > 0 ? 'redis-hit' : 'first-turn'\n  }\n}];"
+      },
+      "id": "b2a6496a-6ab4-46d4-b6e7-dfcccba791c2",
+      "name": "Format History",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        59104,
+        49488
+      ]
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $json.callSid }}",
+        "sessionTTL": 1800,
+        "contextWindowLength": 10
+      },
+      "id": "c82e28be-e77f-43af-9f4b-df4c8ce542c8",
+      "name": "Redis Chat Memory (Get)",
+      "type": "@n8n/n8n-nodes-langchain.memoryRedisChat",
+      "typeVersion": 1.5,
+      "position": [
+        58848,
+        49712
+      ],
+      "credentials": {
+        "redis": {
+          "id": "TOXcBwp2Y2qCuFUh",
+          "name": "Redis account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "insert",
+        "messages": {
+          "messageValues": [
+            {
+              "type": "user",
+              "message": "={{ $json.transcript }}"
+            },
+            {
+              "type": "ai",
+              "message": "={{ $json.spokenResponse + (Array.isArray($json.sources) && $json.sources.length ? '\\n[sources: ' + $json.sources.join(', ') + ']' : '') }}"
+            }
+          ]
+        }
+      },
+      "id": "cf4c91a1-8d5a-43ca-a7e4-f34f0ddf5c38",
+      "name": "Save Memory Messages",
+      "type": "@n8n/n8n-nodes-langchain.memoryManager",
+      "typeVersion": 1.1,
+      "position": [
+        63712,
+        49488
+      ]
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $json.callSid }}",
+        "sessionTTL": 1800,
+        "contextWindowLength": 10
+      },
+      "id": "a5dd8168-5758-4ce3-8a90-ff95b7178ac8",
+      "name": "Redis Chat Memory (Save)",
+      "type": "@n8n/n8n-nodes-langchain.memoryRedisChat",
+      "typeVersion": 1.5,
+      "position": [
+        63712,
+        49712
+      ],
+      "credentials": {
+        "redis": {
+          "id": "TOXcBwp2Y2qCuFUh",
+          "name": "Redis account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "transcript-empty",
+              "leftValue": "={{ ($json.transcript || '').trim() }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "empty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "27f3fb5e-9992-4555-a282-ac9ca78f268d",
+      "name": "Empty Transcript?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        57824,
+        49488
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const twiml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response>\n  <Say voice=\"Polly.Joanna-Neural\">Sorry, I didn't catch that. Please call back when you're ready. Thank you for calling MarbleBee. Goodbye.</Say>\n  <Hangup/>\n</Response>`;\nreturn [{ json: { twiml } }];"
+      },
+      "id": "5c5fa66c-e0ea-41a5-bcbe-da1f9b55bffa",
+      "name": "Build Reprompt TwiML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        58080,
+        49712
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.twiml }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/xml"
+              }
+            ]
+          }
+        }
+      },
+      "id": "108cd6ea-a773-49dd-a3f6-b96279482125",
+      "name": "Respond TwiML (Reprompt)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        58336,
+        49712
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const callSid = $('Extract Speech Fields').first().json.callSid || '';\nconst baseUrl = ($env.N8N_BASE_URL || '').replace(/\\/$/, '');\nconst url = baseUrl + '/webhook/answer-ready?sid=' + encodeURIComponent(callSid) + '&attempt=1';\nconst twiml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response>\n  <Say voice=\"Polly.Joanna-Neural\">Let me look that up for you, one moment.</Say>\n  <Pause length=\"3\"/>\n  <Redirect method=\"POST\">${url.replace(/&/g, '&amp;')}</Redirect>\n</Response>`;\nreturn [{ json: { twiml, callSid } }];"
+      },
+      "id": "769762ea-8ac9-47e9-aaa1-c3c310f86e23",
+      "name": "Build Ack TwiML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        58080,
+        49488
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.twiml }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/xml"
+              }
+            ]
+          }
+        }
+      },
+      "id": "8014e3fe-7f57-4af6-88d6-800491413690",
+      "name": "Respond TwiML (Ack)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        58336,
+        49488
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=answer:{{ $('Finalized Answer').first().json.callSid }}",
+        "value": "={{ JSON.stringify({ intent: $('Finalized Answer').first().json.intent, spokenResponse: $('Finalized Answer').first().json.spokenResponse, sources: $('Finalized Answer').first().json.sources || [], callSid: $('Finalized Answer').first().json.callSid }) }}",
+        "keyType": "string",
+        "expire": true,
+        "ttl": 90
+      },
+      "id": "4dde7c26-9357-470b-96fc-c52cc08e7a82",
+      "name": "Save Answer to Redis",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        63968,
+        49328
+      ],
+      "credentials": {
+        "redis": {
+          "id": "TOXcBwp2Y2qCuFUh",
+          "name": "Redis account"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "answer-ready",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "id": "36191ec2-19c2-404a-9f39-988cfc30e7d2",
+      "name": "Twilio: Answer Ready",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        56800,
+        50000
+      ],
+      "webhookId": "marblebee-rag-answer-ready"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "p-sid",
+              "name": "sid",
+              "value": "={{ $json.query?.sid || $json.body?.CallSid || $json.CallSid || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "p-attempt",
+              "name": "attempt",
+              "value": "={{ parseInt($json.query?.attempt || '1', 10) }}",
+              "type": "number"
+            },
+            {
+              "id": "p-max",
+              "name": "maxAttempts",
+              "value": 6,
+              "type": "number"
+            },
+            {
+              "id": "p-base",
+              "name": "baseUrl",
+              "value": "={{ $env.N8N_BASE_URL }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "b2f82b9c-9fb3-4046-b9cc-39c2e6f89dd2",
+      "name": "Extract Poll Fields",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        57056,
+        50000
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=answer:{{ $json.sid }}",
+        "keyType": "string",
+        "propertyName": "answerJson",
+        "options": {
+          "dotNotation": false
+        }
+      },
+      "id": "6da1e409-011a-49bd-b10e-7e17220eec70",
+      "name": "Read Redis Answer",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        57312,
+        50000
+      ],
+      "credentials": {
+        "redis": {
+          "id": "TOXcBwp2Y2qCuFUh",
+          "name": "Redis account"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "answer-found",
+              "leftValue": "={{ ($json.answerJson || '').toString().length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "df3d4bcc-ffa0-493e-b473-97ffdcd0c500",
+      "name": "Answer Ready?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        57568,
+        50000
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "let data = {};\ntry { data = JSON.parse($json.answerJson || $('Read Redis Answer').first().json.answerJson || '{}'); } catch (e) {}\nconst baseUrl = ($env.N8N_BASE_URL || '').replace(/\\/$/, '');\nconst HINTS = 'Marblebee, Calacatta, Calacatta Viola, Calacatta Monet, Calacatta Rosa, Carrara, Arabescato, Marquina, Volakas, Moon White, Italian Valgri, Travertine, Riverstone, marble bathtub, stone bathtub, designer bathtub, freestanding bathtub, triangle stone basin, marble fountain, marble fireplace, fireplace mantel, marble vanity, marble washbasin, stone sink, marble statue, river vein sandstone, granite, limestone, quartz';\nconst spoken = (data.spokenResponse || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nlet twiml;\nif (data.intent === 'answered') {\n  twiml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response>\n  <Say voice=\"Polly.Joanna-Neural\">${spoken}</Say>\n  <Gather input=\"speech\" action=\"${baseUrl}/webhook/process-speech\" method=\"POST\" speechTimeout=\"3\" timeout=\"8\" actionOnEmptyResult=\"true\" speechModel=\"phone_call\" hints=\"${HINTS}\" language=\"en-US\">\n    <Say voice=\"Polly.Joanna-Neural\">Is there anything else I can help you with?</Say>\n  </Gather>\n  <Say voice=\"Polly.Joanna-Neural\">Thank you for calling MarbleBee. Goodbye.</Say>\n  <Hangup/>\n</Response>`;\n} else {\n  twiml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response>\n  <Say voice=\"Polly.Joanna-Neural\">${spoken || 'Let me have a team member follow up with you with the exact details.'}</Say>\n  <Say voice=\"Polly.Joanna-Neural\">A support ticket has been created and our team will reach you on this number. Thank you for calling MarbleBee.</Say>\n  <Hangup/>\n</Response>`;\n}\nreturn [{ json: { twiml } }];"
+      },
+      "id": "6c06da38-6f7e-430b-b706-d272a7204c8e",
+      "name": "Build Polled Answer TwiML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        57824,
+        49880
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.twiml }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/xml"
+              }
+            ]
+          }
+        }
+      },
+      "id": "a96941db-571c-435f-88d3-72079f0e0e11",
+      "name": "Respond TwiML (Polled Answer)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        58080,
+        49880
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "max-attempts",
+              "leftValue": "={{ $('Extract Poll Fields').first().json.attempt }}",
+              "rightValue": "={{ $('Extract Poll Fields').first().json.maxAttempts }}",
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "3b9042c6-ec25-4645-8cb7-8cc198fa9f9f",
+      "name": "Max Attempts?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        57824,
+        50120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const poll = $('Extract Poll Fields').first().json;\nconst baseUrl = (poll.baseUrl || $env.N8N_BASE_URL || '').replace(/\\/$/, '');\nconst sid = poll.sid;\nconst next = parseInt(poll.attempt, 10) + 1;\nconst url = baseUrl + '/webhook/answer-ready?sid=' + encodeURIComponent(sid) + '&attempt=' + next;\nconst twiml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response>\n  <Pause length=\"3\"/>\n  <Say voice=\"Polly.Joanna-Neural\">Still checking, just a moment.</Say>\n  <Redirect method=\"POST\">${url.replace(/&/g, '&amp;')}</Redirect>\n</Response>`;\nreturn [{ json: { twiml } }];"
+      },
+      "id": "63d435fc-704b-4ed5-8ba1-362f43ab28e2",
+      "name": "Build Still Working TwiML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        58080,
+        50240
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.twiml }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/xml"
+              }
+            ]
+          }
+        }
+      },
+      "id": "26f0dd7f-7c0b-4a7b-b2f7-770f7dd06401",
+      "name": "Respond TwiML (Still Working)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        58336,
+        50240
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const twiml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response>\n  <Say voice=\"Polly.Joanna-Neural\">I'm sorry, I'm having trouble looking that up right now. A team member will reach you on this number shortly. Thank you for calling MarbleBee.</Say>\n  <Hangup/>\n</Response>`;\nreturn [{ json: { twiml } }];"
+      },
+      "id": "f1cb9420-bba2-4ada-a371-16d9dce67da9",
+      "name": "Build Polled Escalation TwiML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        58080,
+        50000
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.twiml }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/xml"
+              }
+            ]
+          }
+        }
+      },
+      "id": "41ebf618-d4cb-4761-8b87-c4cc0bfdd545",
+      "name": "Respond TwiML (Polled Escalation)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        58336,
+        50000
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 5. Async ack + poll loop\nSpeech webhook responds in <500ms with an acknowledgement that redirects to /answer-ready. RAG continues in the background and writes the answer to Redis (`answer:{CallSid}`, TTL 90s). The /answer-ready webhook polls Redis: if ready, speaks the answer; if not, says \"still checking\" + 2s pause + redirects to itself with attempt+1. Caps at 6 attempts (~24s) before falling back to escalation.",
+        "height": 600,
+        "width": 2000,
+        "color": 5
+      },
+      "id": "64067f40-fcc5-4fc5-9517-ae1ddded3e03",
+      "name": "Section 5 Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        56736,
+        49792
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Passthrough: forward whichever parser fired (Parse Context Answer OR Parse RAG Response)\nreturn $input.all();"
+      },
+      "id": "666a4bd2-b44d-468d-a08d-3b99fe13b555",
+      "name": "Finalized Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        63456,
+        49488
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=context:{{ $json.callSid }}",
+        "keyType": "string",
+        "propertyName": "priorContext",
+        "options": {
+          "dotNotation": false
+        }
+      },
+      "id": "4dedaa3a-8580-4656-83c8-fab2c2c80447",
+      "name": "Load Prior Context",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        59360,
+        49488
+      ],
+      "credentials": {
+        "redis": {
+          "id": "TOXcBwp2Y2qCuFUh",
+          "name": "Redis account"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-prior",
+              "leftValue": "={{ ($json.priorContext || '').toString().length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "217ed343-a2cc-47f3-a5c1-a784e0a555ff",
+      "name": "Has Prior Context?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        59616,
+        49488
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "let parsed = {};\ntry { parsed = JSON.parse($json.priorContext || '{}'); } catch (e) {}\nconst speech = $('Extract Speech Fields').first().json || {};\nconst fh = $('Format History').first().json || {};\nreturn [{ json: {\n  priorContextBlock: parsed.contextBlock || '',\n  priorSourceUrls: parsed.sourceUrls || [],\n  callSid: speech.callSid,\n  fromNumber: speech.fromNumber,\n  transcript: speech.transcript,\n  speechConfidence: speech.speechConfidence,\n  startedAt: speech.startedAt,\n  historyText: fh.historyText || '',\n  historyTurnCount: fh.historyTurnCount || 0\n} }];"
+      },
+      "id": "c20567c8-f7bd-42a0-ba75-98cfae7e406d",
+      "name": "Prepare Try Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        59872,
+        49328
+      ]
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "responses": {
+          "values": [
+            {
+              "content": "=You are MarbleBee's after-hours AI voice assistant. You have CHUNKS retrieved during a previous turn of this same call. Decide if you can fully answer the caller's NEW question using ONLY those prior chunks.\n\nDECISION RULES:\n- If the new question is a follow-up about the same product/topic and the prior chunks contain the answer (price, dimensions, material, weight, shipping, etc.), answer from those chunks. intent=\"answered\".\n- If the new question names a different product, asks about info not in the prior chunks, or is unclear, request new retrieval. intent=\"need_retrieval\".\n- Never invent facts. When unsure, choose \"need_retrieval\".\n\nReply ONLY with JSON. Two possible shapes:\n\nIf you CAN answer:\n{\n  \"intent\": \"answered\",\n  \"confidence\": <0.0-1.0>,\n  \"spoken_response\": \"<TTS-ready, under 50 words, prices in words>\",\n  \"summary\": \"<one sentence>\",\n  \"caller_question\": \"<paraphrased — resolve pronouns from prior conversation>\",\n  \"category\": \"order|pricing|product_info|delivery|hours|complaint|general|other\",\n  \"sources\": [\"<URL from prior chunks>\"],\n  \"reasoning\": \"<one sentence — name the chunk you used>\"\n}\n\nIf you need new retrieval:\n{\"intent\": \"need_retrieval\"}\n\nPRIOR RETRIEVED CHUNKS:\n{{ $json.priorContextBlock }}\n\nPRIOR CONVERSATION (oldest to newest):\n{{ $json.historyText || '(no prior turns)' }}\n\nCALLER SAID: {{ $json.transcript || 'no speech detected' }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "id": "5a6ebb0b-29b4-4aa7-86ff-8dff88b6eca2",
+      "name": "Try Answer From Context",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [
+        60128,
+        49328
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "vqyuT7cErwUg10ar",
+          "name": "OpenAI account"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = $input.first().json;\n\nfunction getText(j) {\n  if (!j) return null;\n  if (typeof j.output_text === 'string') return j.output_text;\n  if (typeof j.text === 'string') return j.text;\n  if (typeof j.content === 'string') return j.content;\n  if (typeof j.message?.content === 'string') return j.message.content;\n  if (Array.isArray(j.output)) {\n    for (const item of j.output) {\n      if (Array.isArray(item?.content)) {\n        for (const c of item.content) {\n          if (typeof c?.text === 'string') return c.text;\n        }\n      }\n    }\n  }\n  if (typeof j.choices?.[0]?.message?.content === 'string') return j.choices[0].message.content;\n  return null;\n}\n\nfunction tryParse(s) {\n  if (typeof s !== 'string') return null;\n  const cleaned = s.trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '').trim();\n  try { return JSON.parse(cleaned); } catch { return null; }\n}\n\nlet parsed = null;\nif (out && typeof out.intent === 'string') parsed = out;\nif (!parsed) parsed = tryParse(getText(out));\n\nconst caller = $('Extract Speech Fields').first().json;\nconst ctx = $('Prepare Try Context').first().json;\nconst threshold = $('RAG Config').first().json.confidenceThreshold || 0.85;\nconst startedAt = caller.startedAt;\nconst responseMs = startedAt ? Date.now() - new Date(startedAt).getTime() : null;\n\n// On parse failure or explicit need_retrieval, signal the caller to fall through to full RAG.\nif (!parsed || typeof parsed.intent !== 'string' || parsed.intent === 'need_retrieval') {\n  return [{ json: {\n    intent: 'need_retrieval',\n    canAnswerFromContext: false,\n    callSid: caller.callSid,\n    fromNumber: caller.fromNumber,\n    transcript: caller.transcript,\n    speechConfidence: caller.speechConfidence,\n    aiConfidence: 0,\n    parseStrategy: 'context-need-retrieval'\n  }}];\n}\n\nconst aiConfidence = typeof parsed.confidence === 'number' ? parsed.confidence : 0;\n\n// Low-confidence \"answered\" → also fall through to full RAG.\nif (aiConfidence < threshold) {\n  return [{ json: {\n    intent: 'need_retrieval',\n    canAnswerFromContext: false,\n    callSid: caller.callSid,\n    fromNumber: caller.fromNumber,\n    transcript: caller.transcript,\n    speechConfidence: caller.speechConfidence,\n    aiConfidence,\n    parseStrategy: 'context-low-confidence'\n  }}];\n}\n\nreturn [{ json: {\n  intent: 'answered',\n  aiOriginalIntent: 'answered',\n  aiConfidence,\n  confidenceThreshold: threshold,\n  parseStrategy: 'context-reuse',\n  spokenResponse: parsed.spoken_response,\n  summary: parsed.summary,\n  callerQuestion: parsed.caller_question || caller.transcript,\n  category: (parsed.category || 'general').toLowerCase(),\n  sources: parsed.sources || ctx.priorSourceUrls || [],\n  reasoning: parsed.reasoning,\n  callSid: caller.callSid,\n  fromNumber: caller.fromNumber,\n  transcript: caller.transcript,\n  speechConfidence: caller.speechConfidence,\n  chunksUsed: 0,\n  retrievedChunks: [],\n  retrievedSourceUrls: parsed.sources || ctx.priorSourceUrls || [],\n  responseMs,\n  canAnswerFromContext: true\n} }];"
+      },
+      "id": "08651071-61a1-4cdb-ada3-6c32995d27ff",
+      "name": "Parse Context Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        60384,
+        49328
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "sufficient",
+              "leftValue": "={{ $json.canAnswerFromContext }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "13bcec50-8852-4c34-82cb-705b2d5888c2",
+      "name": "Sufficient?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        60640,
+        49328
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=context:{{ $('Extract Speech Fields').first().json.callSid }}",
+        "value": "={{ JSON.stringify({ contextBlock: $json.contextBlock, sourceUrls: $json.sourceUrls || [], chunksUsed: $json.chunksUsed || 0 }) }}",
+        "keyType": "string",
+        "expire": true,
+        "ttl": 600
+      },
+      "id": "e59a21ab-3b29-4518-a19e-1cafe6e6856e",
+      "name": "Save Context to Redis",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        62688,
+        49808
+      ],
+      "credentials": {
+        "redis": {
+          "id": "TOXcBwp2Y2qCuFUh",
+          "name": "Redis account"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "key": "=answer:{{ $('Clear Session').first().json.callSid }}"
+      },
+      "id": "02ffac35-0de9-46a4-b41a-384eb0832dad",
+      "name": "Delete Redis Answer",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        57568,
+        49152
+      ],
+      "credentials": {
+        "redis": {
+          "id": "TOXcBwp2Y2qCuFUh",
+          "name": "Redis account"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "key": "=context:{{ $('Clear Session').first().json.callSid }}"
+      },
+      "id": "dfdaa8c8-7d5a-4d46-85be-0367e1ae9e79",
+      "name": "Delete Redis Context",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        57824,
+        49152
+      ],
+      "credentials": {
+        "redis": {
+          "id": "TOXcBwp2Y2qCuFUh",
+          "name": "Redis account"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "key": "=answer:{{ $('Extract Poll Fields').first().json.sid }}"
+      },
+      "id": "e2689655-7b66-4956-9b69-6f832497e41c",
+      "name": "Delete Served Answer",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        58336,
+        49880
+      ],
+      "credentials": {
+        "redis": {
+          "id": "TOXcBwp2Y2qCuFUh",
+          "name": "Redis account"
+        }
+      },
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Detect goodbye/hangup phrases up front so we don't burn an LLM call on a\n// caller who's already trying to end the conversation.\nconst raw = ($json.transcript || '').toLowerCase().trim();\n\n// Aggressive normalization: strip all punctuation EXCEPT apostrophe (preserves\n// \"that's\", \"we're\", etc.), collapse whitespace. This lets patterns match across\n// utterances like \"No, no. Thank you.\" → \"no no thank you\".\nconst t = raw.replace(/[^a-z0-9\\s']/g, ' ').replace(/\\s+/g, ' ').trim();\n\nconst goodbyePatterns = [\n  // \"no [no...] thank you\" — handles \"no thank you\", \"no no thank you\", \"no, no. thank you.\"\n  /\\bno+(\\s+no)*\\s+thank\\s*you\\b/,\n  /\\bno\\s+thanks\\b/,\n  /\\bnope\\s+thanks\\b/,\n  // Goodbye phrasings\n  /\\bgood\\s*bye\\b/,\n  /\\bbye\\s+bye\\b/,\n  /\\bthank\\s*you\\s+(goodbye|bye)\\b/,\n  // \"That's all/it/fine/enough/good\"\n  /\\bthat'?s\\s+(all|it|fine|enough|good)\\b/,\n  /\\bnothing\\s+(else|more)\\b/,\n  /\\bthat\\s+(will|would)\\s+be\\s+all\\b/,\n  // \"We're/I'm done/good/fine/all set\"\n  /\\bwe'?re\\s+(done|good|fine|all\\s+set)\\b/,\n  /\\bi'?m\\s+(done|good|fine|all\\s+set)\\b/,\n  // \"Have a good day\"\n  /\\bhave\\s+a\\s+(good|nice|great)\\s+(day|night|evening|one)\\b/,\n  // Bare answers — entire utterance is just one of these\n  /^(no|nope|nah|okay|ok|sure)$/,\n  /^(thanks|thank\\s*you|thank\\s*you\\s+so\\s+much|thanks\\s+a\\s+lot)$/,\n  // \"No more questions\"\n  /^no\\s+(more|further)\\s+questions?$/,\n];\n\nlet wantsToHangup = goodbyePatterns.some(p => p.test(t));\n\n// Heuristic fallback for short polite endings the regex list might miss:\n// short utterance + thanks + no actual question.\nif (!wantsToHangup && t.length > 0) {\n  const wordCount = t.split(/\\s+/).filter(Boolean).length;\n  const hasThanks = /\\b(thank\\s*you|thanks)\\b/.test(t);\n  const hasNo = /\\bno\\b/.test(t);\n  const hasQuestionWord = /\\b(do|does|did|is|are|was|were|can|could|will|would|how|what|when|where|why|which|who|tell|show|give|send|find)\\b/.test(t);\n  const endsWithQuestionMark = /\\?\\s*$/.test(raw);\n\n  if (!hasQuestionWord && !endsWithQuestionMark) {\n    if (hasThanks && wordCount <= 5) wantsToHangup = true;\n    if (hasNo && hasThanks) wantsToHangup = true;\n  }\n}\n\nreturn [{ json: { ...$json, wantsToHangup, normalizedTranscript: t } }];"
+      },
+      "id": "9463f18a-5816-4186-ac84-8fb5eb12cc21",
+      "name": "Classify Intent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        57312,
+        49488
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "hangup",
+              "leftValue": "={{ $json.wantsToHangup }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "dcad1f0d-ad2c-412b-a443-29730695005f",
+      "name": "Wants to Hangup?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        57568,
+        49488
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const twiml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response>\n  <Say voice=\"Polly.Joanna-Neural\">You're welcome. Thank you for calling MarbleBee. Have a great day. Goodbye.</Say>\n  <Hangup/>\n</Response>`;\nreturn [{ json: { twiml } }];"
+      },
+      "id": "f4c103d8-8fb2-4f30-b9a1-63ad3ad356de",
+      "name": "Build Goodbye TwiML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        57824,
+        49328
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.twiml }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/xml"
+              }
+            ]
+          }
+        }
+      },
+      "id": "d8430390-7cb2-4cf0-8401-32f4c58677bd",
+      "name": "Respond TwiML (Goodbye)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        58080,
+        49328
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Twilio: Incoming Call": {
+      "main": [
+        [
+          {
+            "node": "Check Business Hours",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Business Hours": {
+      "main": [
+        [
+          {
+            "node": "Off-Hours?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Off-Hours?": {
+      "main": [
+        [
+          {
+            "node": "Build Off-Hours Greeting",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Forward TwiML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Off-Hours Greeting": {
+      "main": [
+        [
+          {
+            "node": "Respond TwiML (Off-Hours)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Forward TwiML": {
+      "main": [
+        [
+          {
+            "node": "Respond TwiML (Forward)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Twilio: Speech Result": {
+      "main": [
+        [
+          {
+            "node": "Extract Speech Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Speech Fields": {
+      "main": [
+        [
+          {
+            "node": "Classify Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RAG Config": {
+      "main": [
+        [
+          {
+            "node": "Get Memory Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Rewrite (LLM)": {
+      "main": [
+        [
+          {
+            "node": "Extract Rewritten",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Rewritten": {
+      "main": [
+        [
+          {
+            "node": "Embed Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed Query": {
+      "main": [
+        [
+          {
+            "node": "Prepare Variant Pairs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Diversify Retrievals": {
+      "main": [
+        [
+          {
+            "node": "Build Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Context": {
+      "main": [
+        [
+          {
+            "node": "Generate Answer (RAG)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Save Context to Redis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Answer (RAG)": {
+      "main": [
+        [
+          {
+            "node": "Parse RAG Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse RAG Response": {
+      "main": [
+        [
+          {
+            "node": "Finalized Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Can AI Answer?": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Log Ticket → Google Sheet",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Email: Notify Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Variant Pairs": {
+      "main": [
+        [
+          {
+            "node": "Hybrid Search RPC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hybrid Search RPC": {
+      "main": [
+        [
+          {
+            "node": "Fuse Retrievals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fuse Retrievals": {
+      "main": [
+        [
+          {
+            "node": "Diversify Retrievals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Twilio: Call Status": {
+      "main": [
+        [
+          {
+            "node": "Clear Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clear Session": {
+      "main": [
+        [
+          {
+            "node": "Delete Redis Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Redis Session": {
+      "main": [
+        [
+          {
+            "node": "Delete Redis Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Memory Messages": {
+      "main": [
+        [
+          {
+            "node": "Format History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format History": {
+      "main": [
+        [
+          {
+            "node": "Load Prior Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Memory Messages": {
+      "main": [
+        [
+          {
+            "node": "Save Answer to Redis",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log Query → Supabase",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Can AI Answer?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis Chat Memory (Get)": {
+      "ai_memory": [
+        [
+          {
+            "node": "Get Memory Messages",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis Chat Memory (Save)": {
+      "ai_memory": [
+        [
+          {
+            "node": "Save Memory Messages",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Empty Transcript?": {
+      "main": [
+        [
+          {
+            "node": "Build Reprompt TwiML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Ack TwiML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Reprompt TwiML": {
+      "main": [
+        [
+          {
+            "node": "Respond TwiML (Reprompt)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Ack TwiML": {
+      "main": [
+        [
+          {
+            "node": "Respond TwiML (Ack)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond TwiML (Ack)": {
+      "main": [
+        [
+          {
+            "node": "RAG Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Twilio: Answer Ready": {
+      "main": [
+        [
+          {
+            "node": "Extract Poll Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Poll Fields": {
+      "main": [
+        [
+          {
+            "node": "Read Redis Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Redis Answer": {
+      "main": [
+        [
+          {
+            "node": "Answer Ready?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer Ready?": {
+      "main": [
+        [
+          {
+            "node": "Build Polled Answer TwiML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Max Attempts?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Polled Answer TwiML": {
+      "main": [
+        [
+          {
+            "node": "Respond TwiML (Polled Answer)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Max Attempts?": {
+      "main": [
+        [
+          {
+            "node": "Build Polled Escalation TwiML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Still Working TwiML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Polled Escalation TwiML": {
+      "main": [
+        [
+          {
+            "node": "Respond TwiML (Polled Escalation)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Still Working TwiML": {
+      "main": [
+        [
+          {
+            "node": "Respond TwiML (Still Working)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Prior Context": {
+      "main": [
+        [
+          {
+            "node": "Has Prior Context?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Prior Context?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Try Context",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Query Rewrite (LLM)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Try Context": {
+      "main": [
+        [
+          {
+            "node": "Try Answer From Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Try Answer From Context": {
+      "main": [
+        [
+          {
+            "node": "Parse Context Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Context Answer": {
+      "main": [
+        [
+          {
+            "node": "Sufficient?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sufficient?": {
+      "main": [
+        [
+          {
+            "node": "Finalized Answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Query Rewrite (LLM)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalized Answer": {
+      "main": [
+        [
+          {
+            "node": "Save Memory Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Redis Answer": {
+      "main": [
+        [
+          {
+            "node": "Delete Redis Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Redis Context": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond TwiML (Polled Answer)": {
+      "main": [
+        [
+          {
+            "node": "Delete Served Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Intent": {
+      "main": [
+        [
+          {
+            "node": "Wants to Hangup?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wants to Hangup?": {
+      "main": [
+        [
+          {
+            "node": "Build Goodbye TwiML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Empty Transcript?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Goodbye TwiML": {
+      "main": [
+        [
+          {
+            "node": "Respond TwiML (Goodbye)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "errorWorkflow": "8yo2bSYmpT4owr76",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "versionId": "c7f9b9a7-1b55-4ab2-984d-6dd5077f0293",
+  "meta": {
+    "templateId": "rag-starter-template",
+    "templateCredsSetupCompleted": true,
+    "instanceId": "f6dd75d0550aee1abec680ef9e64435c64ea6a1f391e308d16a61bfa3f203a64"
+  },
+  "id": "wOpRKAe1JwyngPYH",
+  "tags": [
+    {
+      "updatedAt": "2026-05-04T06:31:11.799Z",
+      "createdAt": "2026-05-04T06:31:11.799Z",
+      "id": "RxrZUqMoJTCyygZK",
+      "name": "twilio"
+    },
+    {
+      "updatedAt": "2026-05-05T06:53:52.792Z",
+      "createdAt": "2026-05-05T06:53:52.792Z",
+      "id": "fs6sFOYMejDroToJ",
+      "name": "rag"
+    },
+    {
+      "updatedAt": "2026-05-04T06:31:11.727Z",
+      "createdAt": "2026-05-04T06:31:11.727Z",
+      "id": "gMW5pkixVUbFgPS9",
+      "name": "voice-ai"
+    },
+    {
+      "updatedAt": "2026-05-05T06:53:53.652Z",
+      "createdAt": "2026-05-05T06:53:53.652Z",
+      "id": "zdvPL0Vq6RGa1F5G",
+      "name": "marblebee"
+    }
+  ]
+}
