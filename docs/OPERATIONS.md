@@ -297,7 +297,7 @@ This is the worst failure mode. Triage:
 2. Note the `retrieved_urls` and `ai_confidence`
 3. Re-read those URLs manually — does the answer come from there?
    - **Yes, but the page itself is wrong** → fix marblebee.com first, then re-index
-   - **No, the model invented it** → tighten the system prompt with an explicit "do not infer beyond the chunks" rule, and consider implementing finding #7 from [SELF_CRITIQUE.md](./SELF_CRITIQUE.md) (citation-overlap check)
+   - **No, the model invented it** → tighten the system prompt with an explicit "do not infer beyond the chunks" rule, and consider adding a citation-overlap check (compare answer entities to entities in the retrieved chunks)
 
 Label the row `wrong` so it shows up in the weekly report.
 
@@ -412,14 +412,14 @@ The index is reconstructible from `marblebee.com` itself: just run workflow 01 m
 
 - [ ] OpenAI API key stored as n8n credential (not in workflow JSON)
 - [ ] Supabase service_role key stored as n8n credential
-- [ ] `marblebee_query_log.raw_transcript` reviewed for accidental PII (see [SELF_CRITIQUE.md](./SELF_CRITIQUE.md) #6)
-- [ ] Twilio `X-Twilio-Signature` validation enabled (see [SELF_CRITIQUE.md](./SELF_CRITIQUE.md) #9)
+- [ ] `marblebee_query_log.raw_transcript` reviewed for accidental PII (phone numbers, emails, names)
+- [ ] Twilio `X-Twilio-Signature` validation enabled on the public webhooks
 - [ ] OpenAI usage limits set
 - [ ] Supabase RLS policies enabled if multi-tenant
 - [ ] HTTPS-only on n8n public URL
 - [ ] n8n itself behind authentication (basic auth or SSO)
 
-If any of the above are unchecked, the system is not yet production-ready by enterprise standards. Several are flagged as Major in [SELF_CRITIQUE.md](./SELF_CRITIQUE.md).
+If any of the above are unchecked, the system is not yet production-ready by enterprise standards.
 
 ---
 
@@ -428,4 +428,3 @@ If any of the above are unchecked, the system is not yet production-ready by ent
 For changes to this RAG system:
 - Architecture / design: see [ARCHITECTURE.md](./ARCHITECTURE.md)
 - Quality issues: see [EVALUATION.md](./EVALUATION.md)
-- Known weaknesses: see [SELF_CRITIQUE.md](./SELF_CRITIQUE.md)

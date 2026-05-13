@@ -306,5 +306,3 @@ For comparison, the previous "RAG-flavored" workflow:
 | Quality on large catalogs | Doesn't work | Designed to scale |
 
 This is what production teams mean by RAG: **a separate index lifecycle, semantic + lexical retrieval, source attribution, and a measurable feedback loop**.
-
-See [SELF_CRITIQUE.md](./SELF_CRITIQUE.md) for an honest audit of where this design still has gaps.

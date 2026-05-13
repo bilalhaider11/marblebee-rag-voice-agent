@@ -2,7 +2,9 @@
 
 A real RAG voice agent for **MarbleBee**, a wholesale marble, granite, and quartz supplier. Callers ask questions; an AI answers using only what's actually published on `marblebee.com`, cites the sources it used, and gracefully escalates to a human ticket when it isn't confident enough.
 
-> This system is intentionally *not* a demo. It's designed to scale to a real catalog, get measurably better over time, and survive its own self-audit. Read [`docs/SELF_CRITIQUE.md`](./docs/SELF_CRITIQUE.md) for the warts.
+**Walkthrough video:** [Loom — end-to-end tour of both workflows](https://www.loom.com/share/dc6192444526414d9bbc7e12eb3cee30)
+
+> This system is intentionally *not* a demo. It's designed to scale to a real catalog and get measurably better over time.
 
 ---
 
@@ -18,8 +20,7 @@ MarbleBee_RAG_Production/
 └── docs/
     ├── ARCHITECTURE.md                ← system design and decisions
     ├── OPERATIONS.md                  ← setup, monitoring, incident response
-    ├── EVALUATION.md                  ← how to measure & improve quality
-    └── SELF_CRITIQUE.md               ← fair-reviewer audit (25 findings)
+    └── EVALUATION.md                  ← how to measure & improve quality
 ```
 
 ---
@@ -206,33 +207,14 @@ The caller never hears dead air thanks to the async ack + poll pattern: a "Let m
 
 ---
 
-## What this system does NOT yet do
-
-The [self-critique](./docs/SELF_CRITIQUE.md) lists 25 weaknesses, classified by severity. The most consequential ones are:
-
-- No second-stage re-ranker (Major)
-- ~~No conversation-turn history in retrieval~~ — **partially addressed**: chat history is fed into Query Rewrite + Generate Answer, and a context-reuse fast path lets follow-ups skip retrieval entirely when prior chunks already contain the answer
-- Confidence is self-reported by the LLM with no independent signal (Major)
-- No PII redaction before logging the transcript (Major)
-- No Twilio-signature verification on the public webhook (Major — security)
-- No A/B framework for retrieval changes (Major)
-- Context cache is per-call only (`context:{CallSid}`, TTL 600s). Topic-back-switches within a long call still fall through to full RAG (Minor)
-
-Each has a defined fix and rough effort estimate. Plan to close the Majors in the first month of production.
-
----
-
 ## Documentation map
 
 - **Setting it up?** → [`docs/OPERATIONS.md`](./docs/OPERATIONS.md)
 - **Understanding the design?** → [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)
 - **Improving quality?** → [`docs/EVALUATION.md`](./docs/EVALUATION.md)
-- **Auditing for risk?** → [`docs/SELF_CRITIQUE.md`](./docs/SELF_CRITIQUE.md)
 
 ---
 
-## Marketing-honest summary
+## Summary
 
-> "A production-grade RAG voice agent with hybrid retrieval, source diversification, confidence enforcement, and a query-log-driven evaluation loop. Designed to scale to ~50k pages and ~5k calls/month on Supabase free tier. The repository ships with a 25-item self-audit covering everything we deferred — read it before signing the SOW."
-
-Owning the gaps is a stronger sales position than hiding them.
+A production-grade RAG voice agent with hybrid retrieval, source diversification, confidence enforcement, and a query-log-driven evaluation loop. Designed to scale to ~50k pages and ~5k calls/month on Supabase free tier.

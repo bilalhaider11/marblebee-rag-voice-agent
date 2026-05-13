@@ -162,7 +162,7 @@ order by n desc;
 - `good` ≥ 75%
 - `wrong` ≤ 5%
 
-A `wrong` rate above 5% means hallucination is happening. Tighten the system prompt or implement [SELF_CRITIQUE.md](./SELF_CRITIQUE.md) #7 (retrieval-grounded confidence + citation overlap check).
+A `wrong` rate above 5% means hallucination is happening. Tighten the system prompt or add a retrieval-grounded confidence + citation-overlap check.
 
 ---
 
@@ -253,11 +253,11 @@ where reviewer_label = 'wrong' and ai_confidence > 0.85
 order by created_at desc;
 ```
 
-The `ai_response` will reference details that don't appear at any of the `retrieved_urls`. Cause: model hallucination despite high self-rated confidence. Fix: implement citation-overlap check ([SELF_CRITIQUE.md](./SELF_CRITIQUE.md) #7).
+The `ai_response` will reference details that don't appear at any of the `retrieved_urls`. Cause: model hallucination despite high self-rated confidence. Fix: implement a citation-overlap check.
 
 ### "Multi-turn conversations fall apart"
 
-Look for `caller_followup` patterns where one question references a previous turn. Currently every turn is independent — see [SELF_CRITIQUE.md](./SELF_CRITIQUE.md) #3.
+Look for `caller_followup` patterns where one question references a previous turn. Currently every turn is independent — chat history is fed into the rewriter and the final-answer prompt, but retrieval itself does not use prior turns.
 
 ### "Retrieval scores are all low (<0.4) on legitimate queries"
 
@@ -281,7 +281,7 @@ If `rewritten_query` is empty or matches `raw_transcript` exactly, the rewrite s
 2. Run them through the pipeline and grade
 3. Compare results to the previous quarter
 4. Update the gold set with new failure modes
-5. Decide: which improvements from [SELF_CRITIQUE.md](./SELF_CRITIQUE.md) to ship next quarter
+5. Decide: which improvements to ship next quarter
 6. Document the decisions in a `CHANGELOG.md` so future-you knows what was tried
 
 This rhythm is what separates a system that gets better from one that quietly decays.
